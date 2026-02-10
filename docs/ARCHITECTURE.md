@@ -33,8 +33,16 @@ BlazeMQ is a sub-millisecond, Kafka-compatible message broker written in C++20. 
                     +--------+  +-----+  +---------+  +-----------+  +------------+
                          |         |          |
                     +----------------------------------+
+                    |     Consumer Group Handlers       |
+                    |  FindCoordinator, JoinGroup,      |
+                    |  SyncGroup, Heartbeat, LeaveGroup,|
+                    |  OffsetCommit, OffsetFetch        |
+                    +----------------------------------+
+                         |         |          |
+                    +----------------------------------+
                     |        Storage Layer             |
                     |   PartitionLog per topic-partition|
+                    |   ConsumerGroupManager (in-memory)|
                     |   Memory-mapped log segments     |
                     |   Sparse offset index            |
                     +----------------------------------+
@@ -80,6 +88,13 @@ Implements the Kafka binary wire protocol with four components:
 - `decode_fetch()` — Parses fetch requests with offset/partition info
 - `decode_record_batch()` — Full v2 record batch parsing including varints, timestamps, producer metadata; tracks raw byte ranges for zero-copy re-serialization
 - `decode_list_offsets()` — Parses ListOffsets v0-v2 with timestamp-based offset queries
+- `decode_find_coordinator()` — Parses group_id and coordinator_type (v1+)
+- `decode_join_group()` — Parses group membership with session/rebalance timeouts and protocol metadata (BYTES)
+- `decode_sync_group()` — Parses leader assignments (member_id + BYTES assignment pairs)
+- `decode_heartbeat()` — Parses group_id, generation_id, member_id
+- `decode_leave_group()` — Parses group_id, member_id
+- `decode_offset_commit()` — Parses version-aware offset commits (v1 adds timestamp, v2+ adds retention)
+- `decode_offset_fetch()` — Parses group_id with topic-partition arrays
 
 **KafkaEncoder** — Stateless encoder for Kafka responses:
 - `encode_produce_response()` — Per-partition base offsets and error codes
@@ -87,6 +102,13 @@ Implements the Kafka binary wire protocol with four components:
 - `encode_metadata_response()` — Broker list and topic-partition layout (v0 format)
 - `encode_fetch_response()` — Version-aware (v0-v4) with zero-copy record batch data from mmap'd segments
 - `encode_list_offsets_response()` — Version-aware (v0-v2) with earliest/latest offset resolution
+- `encode_find_coordinator_response()` — Version-aware (v0-v2), returns coordinator broker info
+- `encode_join_group_response()` — Version-aware (v0-v3), generation_id, leader, members with BYTES metadata
+- `encode_sync_group_response()` — Version-aware (v0-v2), member assignment as BYTES
+- `encode_heartbeat_response()` — Version-aware (v0-v2), error code for rebalance signaling
+- `encode_leave_group_response()` — Version-aware (v0-v1), error code
+- `encode_offset_commit_response()` — Version-aware (v0-v3), per-partition error codes
+- `encode_offset_fetch_response()` — Version-aware (v0-v3), per-partition offsets with group-level error (v2+)
 
 **RequestRouter** — Callback-based request dispatch:
 - Routes by `ApiKey` to registered handler functions
@@ -101,19 +123,19 @@ Implements the Kafka binary wire protocol with four components:
 | Fetch | 1 | 0-4 | Handled |
 | ListOffsets | 2 | 0-2 | Handled |
 | Metadata | 3 | 0 | Handled |
-| OffsetCommit | 8 | 0-3 | Advertised |
-| OffsetFetch | 9 | 0-3 | Advertised |
-| FindCoordinator | 10 | 0-2 | Advertised |
-| JoinGroup | 11 | 0-3 | Advertised |
-| Heartbeat | 12 | 0-2 | Advertised |
-| LeaveGroup | 13 | 0-1 | Advertised |
-| SyncGroup | 14 | 0-2 | Advertised |
+| OffsetCommit | 8 | 0-3 | Handled |
+| OffsetFetch | 9 | 0-3 | Handled |
+| FindCoordinator | 10 | 0-2 | Handled |
+| JoinGroup | 11 | 0-3 | Handled |
+| Heartbeat | 12 | 0-2 | Handled |
+| LeaveGroup | 13 | 0-1 | Handled |
+| SyncGroup | 14 | 0-2 | Handled |
 | ApiVersions | 18 | 0-3 | Handled |
 | CreateTopics | 19 | 0-3 | Advertised |
 
 ### 3. Storage Layer
 
-**Files:** `include/storage/partition_log.h` (header-only implementation)
+**Files:** `include/storage/partition_log.h`, `include/storage/consumer_group.h` (header-only implementations)
 
 **LogSegment** — A single memory-mapped log file:
 - Pre-allocates segments to `max_size` (default 1GB) using `ftruncate` + `mmap`
@@ -132,6 +154,16 @@ Implements the Kafka binary wire protocol with four components:
 - Serializes `RecordBatch` to Kafka v2 binary format for on-disk storage
 - Zero-copy reads: `read()` returns a raw pointer into the mmap'd segment, scanning batch headers to find the target offset and accumulating bytes up to `max_bytes`
 - Tracks `next_offset` and `high_watermark` atomically
+
+**ConsumerGroupManager** — In-memory consumer group coordination:
+- Manages group state machine: Empty → PreparingRebalance → CompletingRebalance → Stable
+- `join_group()` — Generates member IDs, triggers rebalance, elects leader, chooses protocol by vote
+- `sync_group()` — Leader distributes partition assignments, transitions group to Stable
+- `heartbeat()` — Validates generation/member, checks session timeouts, signals rebalance via error code 27
+- `leave_group()` — Removes member, triggers rebalance or transitions to Empty
+- `offset_commit()`/`offset_fetch()` — In-memory offset storage per (group, topic, partition)
+- Lazy session timeout checks on heartbeat calls (no background timer threads)
+- Thread-safe via `std::mutex` (sufficient for single-broker dev/test use)
 
 **Data layout on disk:**
 ```
@@ -167,12 +199,16 @@ The main function wires all layers together:
 
 1. Initializes `BrokerConfig` with defaults (port 9092, 1GB segments, `/tmp/blazemq/data`)
 2. Creates a lazy topic-partition registry (`unordered_map<TopicPartition, PartitionLog>`)
-3. Sets up `RequestRouter` handlers:
+3. Creates a `ConsumerGroupManager` for in-memory group state
+4. Sets up `RequestRouter` handlers:
    - **Produce handler:** Auto-creates `PartitionLog` on first write, appends record batches, returns base offsets
    - **Fetch handler:** Looks up `PartitionLog`, calls `read()` for zero-copy segment data, returns raw mmap'd bytes
    - **ListOffsets handler:** Resolves timestamp queries (-2=earliest, -1=latest) to actual offsets from `PartitionLog`
    - **Metadata handler:** Auto-creates requested topics (like Kafka's `auto.create.topics.enable`), returns broker info and known topics
-4. Creates `TcpServer` with the router, binds to `0.0.0.0:9092`
+   - **FindCoordinator handler:** Returns self (single broker is always the coordinator)
+   - **JoinGroup/SyncGroup/Heartbeat/LeaveGroup handlers:** Delegate to `ConsumerGroupManager`
+   - **OffsetCommit/OffsetFetch handlers:** Delegate to `ConsumerGroupManager`
+5. Creates `TcpServer` with the router, binds to `0.0.0.0:9092`
 5. Runs the event loop (blocks until SIGINT/SIGTERM)
 
 ## Platform Support

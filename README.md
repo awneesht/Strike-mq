@@ -72,6 +72,9 @@ echo -e "hello\nworld\nblaze" | kcat -b 127.0.0.1:9092 -P -t my-topic
 
 # Consume messages
 kcat -b 127.0.0.1:9092 -C -t my-topic -e
+
+# Consume with consumer group
+kcat -b 127.0.0.1:9092 -G my-group my-topic
 ```
 
 ### Produce and Consume with Python
@@ -84,8 +87,16 @@ producer = KafkaProducer(bootstrap_servers='127.0.0.1:9092')
 producer.send('my-topic', b'hello from python')
 producer.flush()
 
-# Consume
+# Consume (simple)
 consumer = KafkaConsumer('my-topic', bootstrap_servers='127.0.0.1:9092',
+                         auto_offset_reset='earliest')
+for msg in consumer:
+    print(msg.value.decode())
+    break
+
+# Consume with consumer group
+consumer = KafkaConsumer('my-topic', group_id='my-group',
+                         bootstrap_servers='127.0.0.1:9092',
                          auto_offset_reset='earliest')
 for msg in consumer:
     print(msg.value.decode())
@@ -113,10 +124,13 @@ Run benchmarks: `./build/blazemq_bench`
 | Produce | 0–5 | Full (persists to disk) |
 | Fetch | 0–4 | Full (zero-copy from mmap'd segments) |
 | ListOffsets | 0–2 | Full (earliest/latest offset resolution) |
-| FindCoordinator | 0–2 | Advertised |
-| JoinGroup | 0–3 | Advertised |
-| Heartbeat | 0–2 | Advertised |
-| SyncGroup | 0–2 | Advertised |
+| FindCoordinator | 0–2 | Full (returns self as coordinator) |
+| JoinGroup | 0–3 | Full (rebalance protocol, member assignment) |
+| SyncGroup | 0–2 | Full (leader distributes partition assignments) |
+| Heartbeat | 0–2 | Full (session management, rebalance signaling) |
+| LeaveGroup | 0–1 | Full (clean consumer shutdown) |
+| OffsetCommit | 0–3 | Full (in-memory offset storage) |
+| OffsetFetch | 0–3 | Full (retrieve committed offsets) |
 | CreateTopics | 0–3 | Advertised |
 
 ## Project Structure
@@ -127,6 +141,7 @@ Run benchmarks: `./build/blazemq_bench`
 │   ├── network/tcp_server.h      # Event-driven TCP server
 │   ├── protocol/kafka_codec.h    # Kafka encoder/decoder/router
 │   ├── storage/partition_log.h   # mmap'd log segments + index
+│   ├── storage/consumer_group.h # Consumer group state management
 │   └── utils/                    # Ring buffers, memory pool, endian
 ├── src/
 │   ├── main.cpp                  # Broker orchestration
@@ -159,7 +174,7 @@ Or individually:
 
 ## Limitations (v0.1.0)
 
-- No consumer groups (individual consume works, no group coordination)
+- Consumer group offsets are in-memory only (lost on broker restart)
 - No replication (single broker)
 - No SASL/SSL authentication
 - Single-threaded event loop

@@ -1,5 +1,49 @@
 # Changelog
 
+## v0.1.2 — Consumer Group Protocol
+
+### New Features
+
+- **Kafka Consumer Group Protocol** — Full implementation of all 7 consumer group APIs, enabling `kcat -G` and `kafka-python` with `group_id`. Consumers can now coordinate partition assignment, commit offsets, and maintain group membership.
+
+  - **FindCoordinator (API 10, v0-v2)** — Returns self as coordinator (single broker)
+  - **JoinGroup (API 11, v0-v3)** — Member ID generation, rebalance triggering, leader election, protocol selection by vote
+  - **SyncGroup (API 14, v0-v2)** — Leader distributes partition assignments to all members
+  - **Heartbeat (API 12, v0-v2)** — Session management with lazy timeout checks, REBALANCE_IN_PROGRESS signaling
+  - **LeaveGroup (API 13, v0-v1)** — Clean consumer shutdown with rebalance on departure
+  - **OffsetCommit (API 8, v0-v3)** — In-memory per-(group, topic, partition) offset storage
+  - **OffsetFetch (API 9, v0-v3)** — Retrieves committed offsets, returns -1 for uncommitted partitions
+
+- **ConsumerGroupManager** — New header-only class (`include/storage/consumer_group.h`) managing group state machine (Empty → PreparingRebalance → CompletingRebalance → Stable), session timeouts, and committed offsets in memory
+
+- **StringHash** — FNV-1a string hasher added to `types.h` to avoid libc++ ABI issues with `std::hash<std::string>` on Homebrew Clang
+
+### Design Decisions
+
+- **In-memory group state** — No `__consumer_offsets` topic; offsets are lost on restart (acceptable for dev/test)
+- **Immediate rebalance** — No delay timer; generation increments immediately on join/leave
+- **Lazy session timeouts** — Checked during heartbeat calls rather than via background threads
+- **Single broker = coordinator** — FindCoordinator always returns self
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `include/core/types.h` | Added 11 consumer group request/response structs, `StringHash` |
+| `include/protocol/kafka_codec.h` | Added `LeaveGroup` to ApiKey, 4 error codes, 7 decoder/encoder declarations, 7 handler types |
+| `include/storage/consumer_group.h` | **New** — ConsumerGroupManager with group state machine |
+| `src/protocol/kafka_codec.cpp` | 7 decoders, 7 encoders, 7 router switch cases |
+| `src/main.cpp` | ConsumerGroupManager instance, 7 handler lambdas |
+
+### Verified With
+
+- `kcat -b 127.0.0.1:9092 -G test-group test-topic` — Consumer group join, assign, fetch, leave
+- `kcat -X auto.offset.reset=earliest -G test-group test-topic` — Reads pre-existing messages
+- Produce-while-consuming — Messages delivered in real-time to group consumer
+- All existing unit tests pass (ring buffer, memory pool, codec)
+
+---
+
 ## v0.1.1 — Fetch (Consume) & ListOffsets APIs
 
 ### New Features

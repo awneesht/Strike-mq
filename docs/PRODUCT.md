@@ -64,6 +64,9 @@ echo -e "msg1\nmsg2\nmsg3" | kcat -b 127.0.0.1:9092 -P -t my-topic
 # Consume all messages from beginning
 kcat -b 127.0.0.1:9092 -C -t my-topic -e
 
+# Consume with consumer group
+kcat -b 127.0.0.1:9092 -G my-group my-topic
+
 # Verify topic was created
 kcat -b 127.0.0.1:9092 -L
 ```
@@ -78,8 +81,16 @@ producer = KafkaProducer(bootstrap_servers='127.0.0.1:9092')
 producer.send('my-topic', b'hello from python')
 producer.flush()
 
-# Consume
+# Consume (simple)
 consumer = KafkaConsumer('my-topic', bootstrap_servers='127.0.0.1:9092',
+                         auto_offset_reset='earliest')
+for msg in consumer:
+    print(msg.value.decode())
+    break
+
+# Consume with consumer group
+consumer = KafkaConsumer('my-topic', group_id='my-group',
+                         bootstrap_servers='127.0.0.1:9092',
                          auto_offset_reset='earliest')
 for msg in consumer:
     print(msg.value.decode())
@@ -95,15 +106,16 @@ for msg in consumer:
 | Produce | Full | v0-v5, persists to disk |
 | Fetch | Full | v0-v4, zero-copy reads from mmap'd segments |
 | ListOffsets | Full | v0-v2, resolves earliest/latest offsets |
-| OffsetCommit | Advertised | Negotiation only |
-| OffsetFetch | Advertised | Negotiation only |
-| FindCoordinator | Advertised | Negotiation only |
-| JoinGroup | Advertised | Negotiation only |
-| Heartbeat | Advertised | Negotiation only |
-| SyncGroup | Advertised | Negotiation only |
+| OffsetCommit | Full | v0-v3, in-memory offset storage |
+| OffsetFetch | Full | v0-v3, retrieve committed offsets |
+| FindCoordinator | Full | v0-v2, returns self as coordinator |
+| JoinGroup | Full | v0-v3, rebalance protocol with member assignment |
+| SyncGroup | Full | v0-v2, leader distributes partition assignments |
+| Heartbeat | Full | v0-v2, session management and rebalance signaling |
+| LeaveGroup | Full | v0-v1, clean consumer shutdown |
 | CreateTopics | Advertised | Negotiation only |
 
-"Advertised" means the API is listed in the ApiVersions response (required for client compatibility) but returns a minimal response. Full implementation is planned.
+"Advertised" means the API is listed in the ApiVersions response (required for client compatibility) but returns a minimal response.
 
 ## Storage
 
@@ -136,7 +148,7 @@ Run the built-in benchmarks:
 
 ## Limitations (v0.1.0)
 
-- **No consumer groups** — Individual consume works, but no group coordination or offset tracking
+- **Consumer group offsets are in-memory** — Committed offsets are lost on broker restart
 - **No replication** — Single broker, no fault tolerance
 - **No authentication** — No SASL/SSL support
 - **No YAML config loading** — Uses hardcoded defaults from BrokerConfig struct
