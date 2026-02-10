@@ -93,6 +93,123 @@ FetchRequest KafkaDecoder::decode_fetch(BinaryReader& r, const RequestHeader& h)
     return req;
 }
 
+// ---- Consumer Group Decoders ----
+
+FindCoordinatorRequest KafkaDecoder::decode_find_coordinator(BinaryReader& r, const RequestHeader& h) {
+    FindCoordinatorRequest req;
+    req.correlation_id = h.correlation_id;
+    req.api_version = h.api_version;
+    req.group_id = std::string(r.read_string());
+    if (h.api_version >= 1) req.coordinator_type = r.read_int8();
+    return req;
+}
+
+JoinGroupRequest KafkaDecoder::decode_join_group(BinaryReader& r, const RequestHeader& h) {
+    JoinGroupRequest req;
+    req.correlation_id = h.correlation_id;
+    req.api_version = h.api_version;
+    req.client_id = std::string(h.client_id);
+    req.group_id = std::string(r.read_string());
+    req.session_timeout_ms = r.read_int32();
+    if (h.api_version >= 1) req.rebalance_timeout_ms = r.read_int32();
+    req.member_id = std::string(r.read_string());
+    req.protocol_type = std::string(r.read_string());
+    int32_t np = r.read_int32();
+    for (int32_t i = 0; i < np; ++i) {
+        JoinGroupProtocol proto;
+        proto.name = std::string(r.read_string());
+        auto bytes = r.read_bytes();
+        proto.metadata.assign(bytes.begin(), bytes.end());
+        req.protocols.push_back(std::move(proto));
+    }
+    return req;
+}
+
+SyncGroupRequest KafkaDecoder::decode_sync_group(BinaryReader& r, const RequestHeader& h) {
+    SyncGroupRequest req;
+    req.correlation_id = h.correlation_id;
+    req.api_version = h.api_version;
+    req.group_id = std::string(r.read_string());
+    req.generation_id = r.read_int32();
+    req.member_id = std::string(r.read_string());
+    int32_t na = r.read_int32();
+    for (int32_t i = 0; i < na; ++i) {
+        SyncGroupAssignment a;
+        a.member_id = std::string(r.read_string());
+        auto bytes = r.read_bytes();
+        a.assignment.assign(bytes.begin(), bytes.end());
+        req.assignments.push_back(std::move(a));
+    }
+    return req;
+}
+
+HeartbeatRequest KafkaDecoder::decode_heartbeat(BinaryReader& r, const RequestHeader& h) {
+    HeartbeatRequest req;
+    req.correlation_id = h.correlation_id;
+    req.api_version = h.api_version;
+    req.group_id = std::string(r.read_string());
+    req.generation_id = r.read_int32();
+    req.member_id = std::string(r.read_string());
+    return req;
+}
+
+LeaveGroupRequest KafkaDecoder::decode_leave_group(BinaryReader& r, const RequestHeader& h) {
+    LeaveGroupRequest req;
+    req.correlation_id = h.correlation_id;
+    req.api_version = h.api_version;
+    req.group_id = std::string(r.read_string());
+    req.member_id = std::string(r.read_string());
+    return req;
+}
+
+OffsetCommitRequest KafkaDecoder::decode_offset_commit(BinaryReader& r, const RequestHeader& h) {
+    OffsetCommitRequest req;
+    req.correlation_id = h.correlation_id;
+    req.api_version = h.api_version;
+    req.group_id = std::string(r.read_string());
+    if (h.api_version >= 1) {
+        req.generation_id = r.read_int32();
+        req.member_id = std::string(r.read_string());
+    }
+    if (h.api_version >= 2) req.retention_time_ms = r.read_int64();
+    int32_t nt = r.read_int32();
+    for (int32_t t = 0; t < nt; ++t) {
+        auto topic = r.read_string();
+        int32_t np = r.read_int32();
+        for (int32_t p = 0; p < np; ++p) {
+            OffsetCommitPartitionRequest pr;
+            pr.tp.topic = std::string(topic);
+            pr.tp.partition = r.read_int32();
+            pr.offset = r.read_int64();
+            if (h.api_version == 1) pr.timestamp = r.read_int64();
+            pr.metadata = std::string(r.read_string());
+            req.partitions.push_back(std::move(pr));
+        }
+    }
+    return req;
+}
+
+OffsetFetchRequest KafkaDecoder::decode_offset_fetch(BinaryReader& r, const RequestHeader& h) {
+    OffsetFetchRequest req;
+    req.correlation_id = h.correlation_id;
+    req.api_version = h.api_version;
+    req.group_id = std::string(r.read_string());
+    int32_t nt = r.read_int32();
+    for (int32_t t = 0; t < nt; ++t) {
+        auto topic = r.read_string();
+        int32_t np = r.read_int32();
+        for (int32_t p = 0; p < np; ++p) {
+            OffsetFetchPartitionRequest pr;
+            pr.tp.topic = std::string(topic);
+            pr.tp.partition = r.read_int32();
+            req.partitions.push_back(std::move(pr));
+        }
+    }
+    return req;
+}
+
+// ---- Existing Encoders ----
+
 size_t KafkaEncoder::encode_produce_response(uint8_t* buf, size_t cap, int32_t cid,
     const std::vector<ProducePartitionResponse>& parts, const std::string& topic) {
     BinaryWriter w(buf, cap);
@@ -315,6 +432,156 @@ size_t KafkaEncoder::encode_metadata_response(uint8_t* buf, size_t cap, int32_t 
     return w.position();
 }
 
+// ---- Consumer Group Encoders ----
+
+size_t KafkaEncoder::encode_find_coordinator_response(uint8_t* buf, size_t cap, int32_t cid,
+    int16_t api_version, int16_t error_code, int32_t node_id,
+    const std::string& host, int32_t port) {
+    BinaryWriter w(buf, cap);
+    size_t sp = w.write_size_placeholder();
+    w.write_int32(cid);
+    if (api_version >= 1) w.write_int32(0); // throttle_time_ms
+    w.write_int16(error_code);
+    if (api_version >= 1) w.write_string(""); // error_message
+    w.write_int32(node_id);
+    w.write_string(host);
+    w.write_int32(port);
+    w.patch_size(sp);
+    return w.position();
+}
+
+size_t KafkaEncoder::encode_join_group_response(uint8_t* buf, size_t cap, int32_t cid,
+    int16_t api_version, const JoinGroupResponse& resp) {
+    BinaryWriter w(buf, cap);
+    size_t sp = w.write_size_placeholder();
+    w.write_int32(cid);
+    if (api_version >= 2) w.write_int32(0); // throttle_time_ms
+    w.write_int16(resp.error_code);
+    w.write_int32(resp.generation_id);
+    w.write_string(resp.protocol_name);
+    w.write_string(resp.leader_id);
+    w.write_string(resp.member_id);
+    w.write_int32(static_cast<int32_t>(resp.members.size()));
+    for (const auto& m : resp.members) {
+        w.write_string(m.member_id);
+        // Member metadata is BYTES (int32 length-prefix)
+        w.write_int32(static_cast<int32_t>(m.metadata.size()));
+        if (!m.metadata.empty()) {
+            w.write_raw(m.metadata.data(), m.metadata.size());
+        }
+    }
+    w.patch_size(sp);
+    return w.position();
+}
+
+size_t KafkaEncoder::encode_sync_group_response(uint8_t* buf, size_t cap, int32_t cid,
+    int16_t api_version, const SyncGroupResponse& resp) {
+    BinaryWriter w(buf, cap);
+    size_t sp = w.write_size_placeholder();
+    w.write_int32(cid);
+    if (api_version >= 1) w.write_int32(0); // throttle_time_ms
+    w.write_int16(resp.error_code);
+    // Assignment is BYTES (int32 length-prefix)
+    w.write_int32(static_cast<int32_t>(resp.member_assignment.size()));
+    if (!resp.member_assignment.empty()) {
+        w.write_raw(resp.member_assignment.data(), resp.member_assignment.size());
+    }
+    w.patch_size(sp);
+    return w.position();
+}
+
+size_t KafkaEncoder::encode_heartbeat_response(uint8_t* buf, size_t cap, int32_t cid,
+    int16_t api_version, int16_t error_code) {
+    BinaryWriter w(buf, cap);
+    size_t sp = w.write_size_placeholder();
+    w.write_int32(cid);
+    if (api_version >= 1) w.write_int32(0); // throttle_time_ms
+    w.write_int16(error_code);
+    w.patch_size(sp);
+    return w.position();
+}
+
+size_t KafkaEncoder::encode_leave_group_response(uint8_t* buf, size_t cap, int32_t cid,
+    int16_t api_version, int16_t error_code) {
+    BinaryWriter w(buf, cap);
+    size_t sp = w.write_size_placeholder();
+    w.write_int32(cid);
+    if (api_version >= 1) w.write_int32(0); // throttle_time_ms
+    w.write_int16(error_code);
+    w.patch_size(sp);
+    return w.position();
+}
+
+size_t KafkaEncoder::encode_offset_commit_response(uint8_t* buf, size_t cap, int32_t cid,
+    int16_t api_version, const std::vector<OffsetCommitPartitionResponse>& parts) {
+    BinaryWriter w(buf, cap);
+    size_t sp = w.write_size_placeholder();
+    w.write_int32(cid);
+    if (api_version >= 3) w.write_int32(0); // throttle_time_ms
+
+    // Group by topic
+    std::vector<std::string> topics;
+    for (const auto& p : parts) {
+        bool found = false;
+        for (const auto& t : topics) { if (t == p.tp.topic) { found = true; break; } }
+        if (!found) topics.push_back(p.tp.topic);
+    }
+
+    w.write_int32(static_cast<int32_t>(topics.size()));
+    for (const auto& topic : topics) {
+        w.write_string(topic);
+        int32_t np = 0;
+        for (const auto& p : parts) { if (p.tp.topic == topic) ++np; }
+        w.write_int32(np);
+        for (const auto& p : parts) {
+            if (p.tp.topic != topic) continue;
+            w.write_int32(p.tp.partition);
+            w.write_int16(p.error_code);
+        }
+    }
+
+    w.patch_size(sp);
+    return w.position();
+}
+
+size_t KafkaEncoder::encode_offset_fetch_response(uint8_t* buf, size_t cap, int32_t cid,
+    int16_t api_version, const std::vector<OffsetFetchPartitionResponse>& parts,
+    int16_t group_error_code) {
+    BinaryWriter w(buf, cap);
+    size_t sp = w.write_size_placeholder();
+    w.write_int32(cid);
+    if (api_version >= 3) w.write_int32(0); // throttle_time_ms
+
+    // Group by topic
+    std::vector<std::string> topics;
+    for (const auto& p : parts) {
+        bool found = false;
+        for (const auto& t : topics) { if (t == p.tp.topic) { found = true; break; } }
+        if (!found) topics.push_back(p.tp.topic);
+    }
+
+    w.write_int32(static_cast<int32_t>(topics.size()));
+    for (const auto& topic : topics) {
+        w.write_string(topic);
+        int32_t np = 0;
+        for (const auto& p : parts) { if (p.tp.topic == topic) ++np; }
+        w.write_int32(np);
+        for (const auto& p : parts) {
+            if (p.tp.topic != topic) continue;
+            w.write_int32(p.tp.partition);
+            w.write_int64(p.offset);
+            w.write_string(p.metadata);
+            w.write_int16(p.error_code);
+        }
+    }
+
+    // v2+ adds group-level error_code
+    if (api_version >= 2) w.write_int16(group_error_code);
+
+    w.patch_size(sp);
+    return w.position();
+}
+
 size_t RequestRouter::route_request(const uint8_t* req, uint32_t len, uint8_t* resp, size_t cap) {
     // Peek at api_key and api_version (always at offset 0 and 2)
     BinaryReader peek(req, len);
@@ -371,6 +638,73 @@ size_t RequestRouter::route_request(const uint8_t* req, uint32_t len, uint8_t* r
             auto info = metadata_handler_(requested);
             return KafkaEncoder::encode_metadata_response(resp, cap, h.correlation_id,
                 info.broker_id, info.host, info.port, info.topics, info.num_partitions);
+        }
+        break;
+    }
+    case ApiKey::FindCoordinator: {
+        auto request = KafkaDecoder::decode_find_coordinator(r, h);
+        if (find_coordinator_handler_) {
+            int16_t error_code = 0;
+            int32_t node_id = 0;
+            std::string host;
+            int32_t port = 0;
+            find_coordinator_handler_(request, error_code, node_id, host, port);
+            return KafkaEncoder::encode_find_coordinator_response(resp, cap, h.correlation_id,
+                h.api_version, error_code, node_id, host, port);
+        }
+        break;
+    }
+    case ApiKey::JoinGroup: {
+        auto request = KafkaDecoder::decode_join_group(r, h);
+        if (join_group_handler_) {
+            auto response = join_group_handler_(request);
+            return KafkaEncoder::encode_join_group_response(resp, cap, h.correlation_id,
+                h.api_version, response);
+        }
+        break;
+    }
+    case ApiKey::SyncGroup: {
+        auto request = KafkaDecoder::decode_sync_group(r, h);
+        if (sync_group_handler_) {
+            auto response = sync_group_handler_(request);
+            return KafkaEncoder::encode_sync_group_response(resp, cap, h.correlation_id,
+                h.api_version, response);
+        }
+        break;
+    }
+    case ApiKey::Heartbeat: {
+        auto request = KafkaDecoder::decode_heartbeat(r, h);
+        if (heartbeat_handler_) {
+            int16_t error_code = heartbeat_handler_(request);
+            return KafkaEncoder::encode_heartbeat_response(resp, cap, h.correlation_id,
+                h.api_version, error_code);
+        }
+        break;
+    }
+    case ApiKey::LeaveGroup: {
+        auto request = KafkaDecoder::decode_leave_group(r, h);
+        if (leave_group_handler_) {
+            int16_t error_code = leave_group_handler_(request);
+            return KafkaEncoder::encode_leave_group_response(resp, cap, h.correlation_id,
+                h.api_version, error_code);
+        }
+        break;
+    }
+    case ApiKey::OffsetCommit: {
+        auto request = KafkaDecoder::decode_offset_commit(r, h);
+        if (offset_commit_handler_) {
+            auto responses = offset_commit_handler_(request);
+            return KafkaEncoder::encode_offset_commit_response(resp, cap, h.correlation_id,
+                h.api_version, responses);
+        }
+        break;
+    }
+    case ApiKey::OffsetFetch: {
+        auto request = KafkaDecoder::decode_offset_fetch(r, h);
+        if (offset_fetch_handler_) {
+            auto responses = offset_fetch_handler_(request);
+            return KafkaEncoder::encode_offset_fetch_response(resp, cap, h.correlation_id,
+                h.api_version, responses, 0);
         }
         break;
     }

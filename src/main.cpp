@@ -2,6 +2,7 @@
 #include "protocol/kafka_codec.h"
 #include "network/tcp_server.h"
 #include "storage/partition_log.h"
+#include "storage/consumer_group.h"
 #include <csignal>
 #include <iostream>
 #include <memory>
@@ -146,6 +147,41 @@ int main(int /* argc */, char* /* argv */[]) {
         }
         info.num_partitions = 1;
         return info;
+    });
+
+    // Consumer group state
+    blaze::storage::ConsumerGroupManager group_mgr;
+
+    router.set_find_coordinator_handler([&](const blaze::FindCoordinatorRequest&,
+        int16_t& error_code, int32_t& node_id, std::string& host, int32_t& port) {
+        error_code = 0;
+        node_id = config.broker_id;
+        host = config.bind_address == "0.0.0.0" ? "127.0.0.1" : config.bind_address;
+        port = static_cast<int32_t>(config.port);
+    });
+
+    router.set_join_group_handler([&](const blaze::JoinGroupRequest& req) {
+        return group_mgr.join_group(req);
+    });
+
+    router.set_sync_group_handler([&](const blaze::SyncGroupRequest& req) {
+        return group_mgr.sync_group(req);
+    });
+
+    router.set_heartbeat_handler([&](const blaze::HeartbeatRequest& req) {
+        return group_mgr.heartbeat(req);
+    });
+
+    router.set_leave_group_handler([&](const blaze::LeaveGroupRequest& req) {
+        return group_mgr.leave_group(req);
+    });
+
+    router.set_offset_commit_handler([&](const blaze::OffsetCommitRequest& req) {
+        return group_mgr.offset_commit(req);
+    });
+
+    router.set_offset_fetch_handler([&](const blaze::OffsetFetchRequest& req) {
+        return group_mgr.offset_fetch(req);
     });
 
     // Create and start TCP server

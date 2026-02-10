@@ -31,6 +31,17 @@ struct TopicPartitionHash {
     }
 };
 
+struct StringHash {
+    size_t operator()(const std::string& s) const {
+        size_t h = 14695981039346656037ULL;
+        for (char c : s) {
+            h ^= static_cast<size_t>(static_cast<unsigned char>(c));
+            h *= 1099511628211ULL;
+        }
+        return h;
+    }
+};
+
 struct Record {
     int64_t offset = -1;
     int64_t timestamp = 0;
@@ -126,6 +137,120 @@ struct ListOffsetsPartitionResponse {
     int16_t error_code = 0;
     int64_t timestamp = -1;
     int64_t offset = 0;
+};
+
+// ---- Consumer Group API types ----
+
+struct FindCoordinatorRequest {
+    int32_t correlation_id = 0;
+    int16_t api_version = 0;
+    std::string group_id;
+    int8_t coordinator_type = 0; // 0 = group, 1 = transaction (v1+)
+};
+
+struct JoinGroupProtocol {
+    std::string name;
+    std::vector<uint8_t> metadata;
+};
+
+struct JoinGroupRequest {
+    int32_t correlation_id = 0;
+    int16_t api_version = 0;
+    std::string client_id;
+    std::string group_id;
+    int32_t session_timeout_ms = 10000;
+    int32_t rebalance_timeout_ms = 300000; // v1+
+    std::string member_id;
+    std::string protocol_type;
+    std::vector<JoinGroupProtocol> protocols;
+};
+
+struct JoinGroupMember {
+    std::string member_id;
+    std::vector<uint8_t> metadata;
+};
+
+struct JoinGroupResponse {
+    int16_t error_code = 0;
+    int32_t generation_id = -1;
+    std::string protocol_name;
+    std::string leader_id;
+    std::string member_id;
+    std::vector<JoinGroupMember> members;
+};
+
+struct SyncGroupAssignment {
+    std::string member_id;
+    std::vector<uint8_t> assignment;
+};
+
+struct SyncGroupRequest {
+    int32_t correlation_id = 0;
+    int16_t api_version = 0;
+    std::string group_id;
+    int32_t generation_id = -1;
+    std::string member_id;
+    std::vector<SyncGroupAssignment> assignments;
+};
+
+struct SyncGroupResponse {
+    int16_t error_code = 0;
+    std::vector<uint8_t> member_assignment;
+};
+
+struct HeartbeatRequest {
+    int32_t correlation_id = 0;
+    int16_t api_version = 0;
+    std::string group_id;
+    int32_t generation_id = -1;
+    std::string member_id;
+};
+
+struct LeaveGroupRequest {
+    int32_t correlation_id = 0;
+    int16_t api_version = 0;
+    std::string group_id;
+    std::string member_id;
+};
+
+struct OffsetCommitPartitionRequest {
+    TopicPartition tp;
+    int64_t offset = 0;
+    int64_t timestamp = -1; // v1 only
+    std::string metadata;
+};
+
+struct OffsetCommitRequest {
+    int32_t correlation_id = 0;
+    int16_t api_version = 0;
+    std::string group_id;
+    int32_t generation_id = -1;   // v1+
+    std::string member_id;        // v1+
+    int64_t retention_time_ms = -1; // v2+
+    std::vector<OffsetCommitPartitionRequest> partitions;
+};
+
+struct OffsetCommitPartitionResponse {
+    TopicPartition tp;
+    int16_t error_code = 0;
+};
+
+struct OffsetFetchPartitionRequest {
+    TopicPartition tp;
+};
+
+struct OffsetFetchRequest {
+    int32_t correlation_id = 0;
+    int16_t api_version = 0;
+    std::string group_id;
+    std::vector<OffsetFetchPartitionRequest> partitions;
+};
+
+struct OffsetFetchPartitionResponse {
+    TopicPartition tp;
+    int64_t offset = -1;
+    std::string metadata;
+    int16_t error_code = 0;
 };
 
 struct BrokerConfig {
