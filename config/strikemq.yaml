@@ -1,0 +1,20 @@
+network:
+  bind_address: "0.0.0.0"
+  port: 9092
+  io_threads: 0
+
+storage:
+  log_dir: "/tmp/strikemq/data"
+  segment_size: 1073741824
+  retention_ms: 604800000
+
+performance:
+  message_pool_blocks: 1048576
+  message_pool_block_size: 4096
+  adaptive_batching: true
+  batch_threshold_fill_ratio: 0.3
+  max_batch_size: 256
+
+cluster:
+  broker_id: 0
+  replication_factor: 1

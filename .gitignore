@@ -1,0 +1,17 @@
+# Build
+build/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Claude Code
+.claude/
+
+# StrikeMQ data/logs
+/tmp/strikemq/
+*.log

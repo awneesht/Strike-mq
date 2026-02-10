@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="flame" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#FF4D00;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#FF8C00;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#FFD700;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="flameDark" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#CC3D00;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#FF6B00;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="bolt" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#FFFFFF;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#FFE4B5;stop-opacity:1" />
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="4" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="shadow">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#000000" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="256" cy="256" r="240" fill="#1A1A2E" filter="url(#shadow)"/>
+  <circle cx="256" cy="256" r="232" fill="none" stroke="#FF4D00" stroke-width="2" opacity="0.3"/>
+
+  <!-- Outer flame (large) -->
+  <path d="M256 60
+           C220 120, 160 160, 150 220
+           C138 290, 160 340, 190 370
+           C200 340, 210 300, 220 280
+           C215 310, 210 350, 220 390
+           C240 420, 256 440, 256 440
+           C256 440, 272 420, 292 390
+           C302 350, 297 310, 292 280
+           C302 300, 312 340, 322 370
+           C352 340, 374 290, 362 220
+           C352 160, 292 120, 256 60Z"
+        fill="url(#flame)" opacity="0.9"/>
+
+  <!-- Inner flame (accent) -->
+  <path d="M256 140
+           C240 180, 205 210, 200 250
+           C193 300, 210 340, 230 365
+           C235 340, 238 310, 240 295
+           C242 320, 248 360, 256 390
+           C264 360, 270 320, 272 295
+           C274 310, 277 340, 282 365
+           C302 340, 319 300, 312 250
+           C307 210, 272 180, 256 140Z"
+        fill="url(#flameDark)" opacity="0.7"/>
+
+  <!-- Lightning bolt (center) -->
+  <path d="M272 155 L238 270 L268 270 L232 395 L310 240 L274 240 L305 155Z"
+        fill="url(#bolt)" filter="url(#glow)" opacity="0.95"/>
+
+  <!-- Subtle inner glow on bolt -->
+  <path d="M272 155 L238 270 L268 270 L232 395 L310 240 L274 240 L305 155Z"
+        fill="none" stroke="#FFFFFF" stroke-width="1" opacity="0.5"/>
+
+  <!-- Text: StrikeMQ -->
+  <text x="256" y="495" font-family="system-ui, -apple-system, 'Helvetica Neue', Arial, sans-serif"
+        font-size="48" font-weight="800" fill="#FFFFFF" text-anchor="middle" letter-spacing="4">
+    <tspan fill="url(#flame)">STRIKE</tspan><tspan fill="#8892B0">MQ</tspan>
+  </text>
+</svg>
