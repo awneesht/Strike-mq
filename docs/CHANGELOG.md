@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.1.1 — Fetch (Consume) & ListOffsets APIs
+
+### New Features
+
+- **Kafka Fetch API (consume)** — Full implementation of Fetch v0-v4. Kafka clients can now consume messages from BlazeMQ using standard consumer APIs. Uses zero-copy reads directly from mmap'd log segments.
+  - `encode_fetch_response()` — Version-aware encoder: v0 basic, v1+ adds `throttle_time_ms`, v4+ adds `last_stable_offset` and `aborted_transactions`
+  - `PartitionLog::read()` — Scans segment batch headers via sparse offset index, returns raw pointer + size into mmap'd data
+  - `ReadResult` struct for zero-copy return values
+  - `FetchPartitionResponse` struct with mmap pointer fields
+
+- **Kafka ListOffsets API** — Full implementation of ListOffsets v0-v2. Resolves logical offsets (earliest=-2, latest=-1) to actual offset numbers, required by clients before fetching.
+  - `decode_list_offsets()` — Parses v0-v2 requests with topic-partition arrays and timestamps
+  - `encode_list_offsets_response()` — v0 returns offset array, v1+ returns single offset+timestamp, v2+ adds `throttle_time_ms`
+
+### Bug Fixes
+
+#### Record Batch Serialization Field Width (Critical)
+
+**Problem:** `serialize_batch()` in `partition_log.h` wrote the `attributes` field (INT16) and `producer_epoch` field (INT16) as 4-byte INT32 values using `w32()`. This added 4 extra bytes to the batch header, shifting all record data. When librdkafka parsed the batch with correct field sizes, every field after `attributes` was misaligned, causing the varint parser to read garbage values (e.g., `expected 18446744073709551613 bytes`).
+
+**Fix:** Added `w16()` lambda for 2-byte writes and used it for `attributes` and `producer_epoch` fields.
+
+#### Record Byte Range Tracking in Decoder
+
+**Problem:** `decode_record_batch()` set `Record.data = nullptr` and calculated `total_size` as only `key_length + value_length`, missing the varint overhead bytes. When re-serializing records for Fetch responses, the byte range was incomplete.
+
+**Fix:** Track `rec_start = r.current()` before parsing each record and set `rec.data` / `rec.total_size` to the full byte range including all varint headers.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `include/core/types.h` | Added `FetchPartitionResponse`, `ListOffsetsRequest`, `ListOffsetsPartitionResponse` structs |
+| `include/storage/partition_log.h` | Added `ReadResult` struct, implemented `read()` with batch scanning, fixed `serialize_batch()` INT16 fields |
+| `include/protocol/kafka_codec.h` | Added `encode_fetch_response()`, `encode_list_offsets_response()`, `decode_list_offsets()`, `write_raw()`, updated `FetchHandler` typedef, added `ListOffsetsHandler` |
+| `src/protocol/kafka_codec.cpp` | Implemented Fetch/ListOffsets encode/decode, added router cases, fixed `decode_record_batch()` byte tracking |
+| `src/main.cpp` | Registered Fetch and ListOffsets handlers |
+
+### Verified With
+
+- `echo "hello" | kcat -b 127.0.0.1:9092 -P -t test-topic` — Produces messages
+- `kcat -b 127.0.0.1:9092 -C -t test-topic -e` — Consumes all messages and exits
+- Multi-message produce/consume — Correct ordering verified
+- Python `kafka-python` KafkaConsumer — Reads messages from earliest offset
+- All unit tests pass (ring buffer, memory pool, codec)
+
+---
+
 ## v0.1.0 — TCP Networking & Kafka Client Compatibility
 
 ### New Features

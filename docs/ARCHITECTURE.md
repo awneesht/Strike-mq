@@ -27,11 +27,11 @@ BlazeMQ is a sub-millisecond, Kafka-compatible message broker written in C++20. 
                     |   ApiKey to handler callbacks    |
                     +----------------------------------+
                          |              |           |
-                    +--------+    +---------+  +-----------+
-                    |Produce |    |Metadata |  |ApiVersions|
-                    |Handler |    |Handler  |  |(built-in) |
-                    +--------+    +---------+  +-----------+
-                         |              |
+                    +--------+  +-----+  +---------+  +-----------+  +------------+
+                    |Produce |  |Fetch|  |Metadata |  |ApiVersions|  |ListOffsets |
+                    |Handler |  |     |  |Handler  |  |(built-in) |  |Handler     |
+                    +--------+  +-----+  +---------+  +-----------+  +------------+
+                         |         |          |
                     +----------------------------------+
                     |        Storage Layer             |
                     |   PartitionLog per topic-partition|
@@ -78,12 +78,15 @@ Implements the Kafka binary wire protocol with four components:
 - `decode_header()` — Reads ApiKey, api_version, correlation_id, client_id
 - `decode_produce()` — Parses topic-partition arrays with record batches (v2 magic)
 - `decode_fetch()` — Parses fetch requests with offset/partition info
-- `decode_record_batch()` — Full v2 record batch parsing including varints, timestamps, producer metadata
+- `decode_record_batch()` — Full v2 record batch parsing including varints, timestamps, producer metadata; tracks raw byte ranges for zero-copy re-serialization
+- `decode_list_offsets()` — Parses ListOffsets v0-v2 with timestamp-based offset queries
 
 **KafkaEncoder** — Stateless encoder for Kafka responses:
 - `encode_produce_response()` — Per-partition base offsets and error codes
 - `encode_api_versions_response()` — Dual format: v0-v2 (standard) and v3+ (flexible versions with compact arrays and tagged fields)
 - `encode_metadata_response()` — Broker list and topic-partition layout (v0 format)
+- `encode_fetch_response()` — Version-aware (v0-v4) with zero-copy record batch data from mmap'd segments
+- `encode_list_offsets_response()` — Version-aware (v0-v2) with earliest/latest offset resolution
 
 **RequestRouter** — Callback-based request dispatch:
 - Routes by `ApiKey` to registered handler functions
@@ -95,8 +98,8 @@ Implements the Kafka binary wire protocol with four components:
 | API | Key | Versions | Status |
 |-----|-----|----------|--------|
 | Produce | 0 | 0-5 | Handled |
-| Fetch | 1 | 0-5 | Advertised |
-| ListOffsets | 2 | 0-2 | Advertised |
+| Fetch | 1 | 0-4 | Handled |
+| ListOffsets | 2 | 0-2 | Handled |
 | Metadata | 3 | 0 | Handled |
 | OffsetCommit | 8 | 0-3 | Advertised |
 | OffsetFetch | 9 | 0-3 | Advertised |
@@ -127,6 +130,7 @@ Implements the Kafka binary wire protocol with four components:
 - Auto-creates directory structure: `{log_dir}/{topic}-{partition}/`
 - Rolls to a new segment when the active segment reaches 95% capacity
 - Serializes `RecordBatch` to Kafka v2 binary format for on-disk storage
+- Zero-copy reads: `read()` returns a raw pointer into the mmap'd segment, scanning batch headers to find the target offset and accumulating bytes up to `max_bytes`
 - Tracks `next_offset` and `high_watermark` atomically
 
 **Data layout on disk:**
@@ -165,6 +169,8 @@ The main function wires all layers together:
 2. Creates a lazy topic-partition registry (`unordered_map<TopicPartition, PartitionLog>`)
 3. Sets up `RequestRouter` handlers:
    - **Produce handler:** Auto-creates `PartitionLog` on first write, appends record batches, returns base offsets
+   - **Fetch handler:** Looks up `PartitionLog`, calls `read()` for zero-copy segment data, returns raw mmap'd bytes
+   - **ListOffsets handler:** Resolves timestamp queries (-2=earliest, -1=latest) to actual offsets from `PartitionLog`
    - **Metadata handler:** Auto-creates requested topics (like Kafka's `auto.create.topics.enable`), returns broker info and known topics
 4. Creates `TcpServer` with the router, binds to `0.0.0.0:9092`
 5. Runs the event loop (blocks until SIGINT/SIGTERM)

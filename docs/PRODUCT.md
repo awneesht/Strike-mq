@@ -61,6 +61,9 @@ echo "hello world" | kcat -b 127.0.0.1:9092 -P -t my-topic
 # Produce multiple messages
 echo -e "msg1\nmsg2\nmsg3" | kcat -b 127.0.0.1:9092 -P -t my-topic
 
+# Consume all messages from beginning
+kcat -b 127.0.0.1:9092 -C -t my-topic -e
+
 # Verify topic was created
 kcat -b 127.0.0.1:9092 -L
 ```
@@ -68,11 +71,19 @@ kcat -b 127.0.0.1:9092 -L
 ### Test with Python
 
 ```python
-from kafka import KafkaProducer
+from kafka import KafkaProducer, KafkaConsumer
 
+# Produce
 producer = KafkaProducer(bootstrap_servers='127.0.0.1:9092')
 producer.send('my-topic', b'hello from python')
 producer.flush()
+
+# Consume
+consumer = KafkaConsumer('my-topic', bootstrap_servers='127.0.0.1:9092',
+                         auto_offset_reset='earliest')
+for msg in consumer:
+    print(msg.value.decode())
+    break
 ```
 
 ## Supported Kafka APIs
@@ -82,8 +93,8 @@ producer.flush()
 | ApiVersions | Full | v0-v3 including flexible versions |
 | Metadata | Full | v0, auto-creates topics |
 | Produce | Full | v0-v5, persists to disk |
-| Fetch | Partial | Advertised, basic response |
-| ListOffsets | Advertised | Negotiation only |
+| Fetch | Full | v0-v4, zero-copy reads from mmap'd segments |
+| ListOffsets | Full | v0-v2, resolves earliest/latest offsets |
 | OffsetCommit | Advertised | Negotiation only |
 | OffsetFetch | Advertised | Negotiation only |
 | FindCoordinator | Advertised | Negotiation only |
@@ -125,7 +136,7 @@ Run the built-in benchmarks:
 
 ## Limitations (v0.1.0)
 
-- **No consumer groups** — Fetch API returns minimal responses; no offset tracking
+- **No consumer groups** — Individual consume works, but no group coordination or offset tracking
 - **No replication** — Single broker, no fault tolerance
 - **No authentication** — No SASL/SSL support
 - **No YAML config loading** — Uses hardcoded defaults from BrokerConfig struct

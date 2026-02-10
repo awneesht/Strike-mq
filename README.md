@@ -61,24 +61,35 @@ cmake --build .
 Broker ready. Press Ctrl+C to stop.
 ```
 
-### Produce with kcat
+### Produce and Consume with kcat
 
 ```bash
 # List broker metadata
 kcat -b 127.0.0.1:9092 -L
 
-# Produce a message
-echo "hello world" | kcat -b 127.0.0.1:9092 -P -t my-topic
+# Produce messages
+echo -e "hello\nworld\nblaze" | kcat -b 127.0.0.1:9092 -P -t my-topic
+
+# Consume messages
+kcat -b 127.0.0.1:9092 -C -t my-topic -e
 ```
 
-### Produce with Python
+### Produce and Consume with Python
 
 ```python
-from kafka import KafkaProducer
+from kafka import KafkaProducer, KafkaConsumer
 
+# Produce
 producer = KafkaProducer(bootstrap_servers='127.0.0.1:9092')
 producer.send('my-topic', b'hello from python')
 producer.flush()
+
+# Consume
+consumer = KafkaConsumer('my-topic', bootstrap_servers='127.0.0.1:9092',
+                         auto_offset_reset='earliest')
+for msg in consumer:
+    print(msg.value.decode())
+    break
 ```
 
 ## Performance
@@ -100,7 +111,8 @@ Run benchmarks: `./build/blazemq_bench`
 | ApiVersions | 0–3 | Full (including flexible versions) |
 | Metadata | 0 | Full (auto-topic creation) |
 | Produce | 0–5 | Full (persists to disk) |
-| Fetch | 0–5 | Advertised |
+| Fetch | 0–4 | Full (zero-copy from mmap'd segments) |
+| ListOffsets | 0–2 | Full (earliest/latest offset resolution) |
 | FindCoordinator | 0–2 | Advertised |
 | JoinGroup | 0–3 | Advertised |
 | Heartbeat | 0–2 | Advertised |
@@ -147,7 +159,7 @@ Or individually:
 
 ## Limitations (v0.1.0)
 
-- No consumer groups or offset tracking
+- No consumer groups (individual consume works, no group coordination)
 - No replication (single broker)
 - No SASL/SSL authentication
 - Single-threaded event loop
