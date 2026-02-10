@@ -89,6 +89,14 @@ struct ProducePartitionResponse {
     int64_t log_start_offset = 0;
 };
 
+struct FetchPartitionResponse {
+    TopicPartition tp;
+    int16_t error_code = 0;
+    int64_t high_watermark = -1;
+    const uint8_t* record_data = nullptr;
+    uint32_t record_data_size = 0;
+};
+
 struct FetchRequest {
     int32_t correlation_id = 0;
     std::string client_id;
@@ -101,6 +109,23 @@ struct FetchRequest {
         int32_t partition_max_bytes = 1048576;
     };
     std::vector<PartitionFetch> partitions;
+};
+
+struct ListOffsetsRequest {
+    int32_t correlation_id = 0;
+    int16_t api_version = 0;
+    struct PartitionRequest {
+        TopicPartition tp;
+        int64_t timestamp = -1; // -1 = latest, -2 = earliest
+    };
+    std::vector<PartitionRequest> partitions;
+};
+
+struct ListOffsetsPartitionResponse {
+    TopicPartition tp;
+    int16_t error_code = 0;
+    int64_t timestamp = -1;
+    int64_t offset = 0;
 };
 
 struct BrokerConfig {

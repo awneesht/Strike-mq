@@ -51,14 +51,16 @@ RecordBatch KafkaDecoder::decode_record_batch(BinaryReader& r) {
     int32_t nr = r.read_int32();
     for (int32_t i = 0; i < nr; ++i) {
         Record rec;
-        r.read_signed_varint(); r.read_int8();
-        int32_t td = r.read_signed_varint(); r.read_signed_varint();
+        const uint8_t* rec_start = r.current();
+        r.read_signed_varint(); r.read_int8(); // length, attributes
+        int32_t td = r.read_signed_varint(); r.read_signed_varint(); // timestampDelta, offsetDelta
         int32_t kl = r.read_signed_varint(); if (kl >= 0) { rec.key_length = kl; r.skip(kl); }
         int32_t vl = r.read_signed_varint(); if (vl >= 0) { rec.value_offset = rec.key_length; rec.value_length = vl; r.skip(vl); }
         int32_t nh = r.read_signed_varint();
         for (int32_t h = 0; h < nh; ++h) { int32_t hk=r.read_signed_varint(); r.skip(hk); int32_t hv=r.read_signed_varint(); if(hv>=0) r.skip(hv); }
         rec.timestamp = b.first_timestamp + td;
-        rec.total_size = rec.key_length + rec.value_length;
+        rec.data = const_cast<uint8_t*>(rec_start);
+        rec.total_size = static_cast<uint32_t>(r.current() - rec_start);
         b.records.push_back(std::move(rec));
     }
     b.last_offset = b.base_offset + last_off_d;
@@ -108,6 +110,116 @@ size_t KafkaEncoder::encode_produce_response(uint8_t* buf, size_t cap, int32_t c
     return w.position();
 }
 
+ListOffsetsRequest KafkaDecoder::decode_list_offsets(BinaryReader& r, const RequestHeader& h) {
+    ListOffsetsRequest req;
+    req.correlation_id = h.correlation_id;
+    req.api_version = h.api_version;
+    r.read_int32(); // replica_id
+    if (h.api_version >= 2) r.read_int8(); // isolation_level
+    int32_t nt = r.read_int32();
+    for (int32_t t = 0; t < nt; ++t) {
+        auto topic = r.read_string();
+        int32_t np = r.read_int32();
+        for (int32_t p = 0; p < np; ++p) {
+            ListOffsetsRequest::PartitionRequest pr;
+            pr.tp.topic = std::string(topic);
+            pr.tp.partition = r.read_int32();
+            pr.timestamp = r.read_int64();
+            if (h.api_version == 0) r.read_int32(); // max_num_offsets (v0 only)
+            req.partitions.push_back(std::move(pr));
+        }
+    }
+    return req;
+}
+
+size_t KafkaEncoder::encode_list_offsets_response(uint8_t* buf, size_t cap, int32_t cid,
+    const std::vector<ListOffsetsPartitionResponse>& parts, int16_t api_version) {
+    BinaryWriter w(buf, cap);
+    size_t sp = w.write_size_placeholder();
+    w.write_int32(cid);
+
+    // v2+ adds throttle_time_ms
+    if (api_version >= 2) w.write_int32(0);
+
+    // Group by topic
+    std::vector<std::string> topics;
+    for (const auto& p : parts) {
+        bool found = false;
+        for (const auto& t : topics) { if (t == p.tp.topic) { found = true; break; } }
+        if (!found) topics.push_back(p.tp.topic);
+    }
+
+    w.write_int32(static_cast<int32_t>(topics.size()));
+    for (const auto& topic : topics) {
+        w.write_string(topic);
+        int32_t np = 0;
+        for (const auto& p : parts) { if (p.tp.topic == topic) ++np; }
+        w.write_int32(np);
+        for (const auto& p : parts) {
+            if (p.tp.topic != topic) continue;
+            w.write_int32(p.tp.partition);
+            w.write_int16(p.error_code);
+            if (api_version == 0) {
+                // v0: array of offsets
+                w.write_int32(1); // one offset
+                w.write_int64(p.offset);
+            } else {
+                // v1+: timestamp + single offset
+                w.write_int64(p.timestamp);
+                w.write_int64(p.offset);
+            }
+        }
+    }
+
+    w.patch_size(sp);
+    return w.position();
+}
+
+size_t KafkaEncoder::encode_fetch_response(uint8_t* buf, size_t cap, int32_t cid,
+    const std::vector<FetchPartitionResponse>& parts, int16_t api_version) {
+    BinaryWriter w(buf, cap);
+    size_t sp = w.write_size_placeholder();
+    w.write_int32(cid);
+
+    // v1+ adds throttle_time_ms
+    if (api_version >= 1) w.write_int32(0); // throttle_time_ms
+
+    // Group partitions by topic
+    std::vector<std::string> topics;
+    for (const auto& p : parts) {
+        bool found = false;
+        for (const auto& t : topics) { if (t == p.tp.topic) { found = true; break; } }
+        if (!found) topics.push_back(p.tp.topic);
+    }
+
+    w.write_int32(static_cast<int32_t>(topics.size()));
+    for (const auto& topic : topics) {
+        w.write_string(topic);
+        int32_t np = 0;
+        for (const auto& p : parts) { if (p.tp.topic == topic) ++np; }
+        w.write_int32(np);
+        for (const auto& p : parts) {
+            if (p.tp.topic != topic) continue;
+            w.write_int32(p.tp.partition);
+            w.write_int16(p.error_code);
+            w.write_int64(p.high_watermark);
+            // v4+ adds last_stable_offset and aborted_transactions
+            if (api_version >= 4) {
+                w.write_int64(p.high_watermark); // last_stable_offset = high_watermark
+                w.write_int32(-1); // aborted_transactions: null array (-1)
+            }
+            // Record batches as raw bytes
+            w.write_int32(static_cast<int32_t>(p.record_data_size));
+            if (p.record_data && p.record_data_size > 0) {
+                w.write_raw(p.record_data, p.record_data_size);
+            }
+        }
+    }
+
+    w.patch_size(sp);
+    return w.position();
+}
+
 // Helper: write unsigned varint (Kafka compact encoding)
 static void write_uvarint(BinaryWriter& w, uint32_t val) {
     while (val > 0x7F) {
@@ -122,7 +234,7 @@ size_t KafkaEncoder::encode_api_versions_response(uint8_t* buf, size_t cap, int3
     // Advertise a standard Kafka broker API set so librdkafka allocates correctly
     struct { int16_t k, mn, mx; } apis[] = {
         {0, 0, 5},   // Produce
-        {1, 0, 5},   // Fetch
+        {1, 0, 4},   // Fetch (v0-v4 — v4 needed for MsgVer2/record batches)
         {2, 0, 2},   // ListOffsets
         {3, 0, 0},   // Metadata (v0 only)
         {8, 0, 3},   // OffsetCommit
@@ -227,6 +339,22 @@ size_t RequestRouter::route_request(const uint8_t* req, uint32_t len, uint8_t* r
             auto responses = produce_handler_(request);
             std::string topic = request.batches.empty() ? "" : request.batches[0].topic_partition.topic;
             return KafkaEncoder::encode_produce_response(resp, cap, h.correlation_id, responses, topic);
+        }
+        break;
+    }
+    case ApiKey::ListOffsets: {
+        auto request = KafkaDecoder::decode_list_offsets(r, h);
+        if (list_offsets_handler_) {
+            auto responses = list_offsets_handler_(request);
+            return KafkaEncoder::encode_list_offsets_response(resp, cap, h.correlation_id, responses, h.api_version);
+        }
+        break;
+    }
+    case ApiKey::Fetch: {
+        auto request = KafkaDecoder::decode_fetch(r, h);
+        if (fetch_handler_) {
+            auto responses = fetch_handler_(request);
+            return KafkaEncoder::encode_fetch_response(resp, cap, h.correlation_id, responses, h.api_version);
         }
         break;
     }

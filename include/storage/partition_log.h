@@ -84,6 +84,12 @@ struct OffsetIndex {
     void add(int64_t offset, uint64_t position) { entries.push_back({offset, position}); }
 };
 
+struct ReadResult {
+    const uint8_t* data = nullptr;
+    uint32_t size = 0;
+    int64_t high_watermark = -1;
+};
+
 class PartitionLog {
 public:
     PartitionLog(const TopicPartition& tp, const std::string& base_dir, uint64_t segment_size)
@@ -113,10 +119,59 @@ public:
         return base_offset;
     }
 
-    [[nodiscard]] std::vector<RecordBatch> read(int64_t start, int32_t max_bytes) const {
-        std::vector<RecordBatch> result;
-        RecordBatch b; b.base_offset = start; b.topic_partition = tp_;
-        result.push_back(std::move(b));
+    [[nodiscard]] ReadResult read(int64_t start_offset, int32_t max_bytes) const {
+        ReadResult result;
+        result.high_watermark = high_watermark();
+
+        if (start_offset >= next_offset_.load(std::memory_order_acquire))
+            return result; // nothing to read
+
+        // Find byte position via sparse index
+        uint64_t pos = index_.lookup(start_offset);
+        uint64_t seg_size = active_segment_->size();
+        if (seg_size == 0 || pos >= seg_size) return result;
+
+        // Get raw pointer to segment data
+        const uint8_t* seg = active_segment_->read(0, static_cast<uint32_t>(seg_size));
+        if (!seg) return result;
+
+        // Scan forward to find first batch with baseOffset >= start_offset
+        uint64_t scan = pos;
+        uint64_t start_pos = scan;
+        bool found_start = false;
+
+        while (scan + 12 <= seg_size) {
+            // Read baseOffset (8 bytes BE) + batchLength (4 bytes BE)
+            uint64_t bo_raw; std::memcpy(&bo_raw, seg + scan, 8);
+            int64_t batch_base = static_cast<int64_t>(blaze::bswap64(bo_raw));
+            uint32_t bl_raw; std::memcpy(&bl_raw, seg + scan + 8, 4);
+            int32_t batch_len = static_cast<int32_t>(blaze::bswap32(bl_raw));
+
+            if (batch_len <= 0) break; // end of valid data
+            uint32_t total = 12 + static_cast<uint32_t>(batch_len);
+            if (scan + total > seg_size) break; // incomplete batch
+
+            if (!found_start) {
+                // Check if this batch contains or follows start_offset
+                if (batch_base >= start_offset) {
+                    start_pos = scan;
+                    found_start = true;
+                } else {
+                    // This batch is before start_offset, skip it
+                    scan += total;
+                    start_pos = scan;
+                    continue;
+                }
+            }
+
+            scan += total;
+            if (static_cast<int32_t>(scan - start_pos) >= max_bytes) break;
+        }
+
+        if (scan > start_pos) {
+            result.data = seg + start_pos;
+            result.size = static_cast<uint32_t>(scan - start_pos);
+        }
         return result;
     }
 
@@ -146,18 +201,22 @@ private:
             uint32_t be = blaze::bswap32(static_cast<uint32_t>(v));
             std::memcpy(buf + pos, &be, 4); pos += 4;
         };
+        auto w16 = [&](int16_t v) {
+            uint16_t be = blaze::bswap16(static_cast<uint16_t>(v));
+            std::memcpy(buf + pos, &be, 2); pos += 2;
+        };
 
         w64(batch.base_offset);
         w32(0); // batchLength placeholder
         w32(batch.partition_leader_epoch);
         buf[pos++] = static_cast<uint8_t>(batch.magic);
         w32(0); // CRC placeholder
-        w32(static_cast<int32_t>(batch.attributes));
+        w16(batch.attributes);
         w32(static_cast<int32_t>(batch.records.size()) - 1); // lastOffsetDelta
         w64(batch.first_timestamp);
         w64(batch.max_timestamp);
         w64(batch.producer_id);
-        w32(static_cast<int32_t>(batch.producer_epoch));
+        w16(batch.producer_epoch);
         w32(batch.base_sequence);
         w32(static_cast<int32_t>(batch.records.size()));
 

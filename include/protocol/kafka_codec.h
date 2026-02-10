@@ -98,6 +98,9 @@ public:
         std::memcpy(data_ + ph, &be, 4);
     }
 
+    void write_raw(const uint8_t* src, size_t len) {
+        std::memcpy(data_ + pos_, src, len); pos_ += len;
+    }
     [[nodiscard]] size_t position() const { return pos_; }
     [[nodiscard]] uint8_t* data() { return data_; }
 private:
@@ -109,6 +112,7 @@ public:
     static RequestHeader decode_header(BinaryReader& r);
     static ProduceRequest decode_produce(BinaryReader& r, const RequestHeader& h);
     static FetchRequest decode_fetch(BinaryReader& r, const RequestHeader& h);
+    static ListOffsetsRequest decode_list_offsets(BinaryReader& r, const RequestHeader& h);
     static RecordBatch decode_record_batch(BinaryReader& r);
 };
 
@@ -118,6 +122,10 @@ public:
         const std::vector<ProducePartitionResponse>& parts, const std::string& topic);
     static size_t encode_api_versions_response(uint8_t* buf, size_t cap, int32_t corr_id,
         int16_t api_version);
+    static size_t encode_fetch_response(uint8_t* buf, size_t cap, int32_t corr_id,
+        const std::vector<FetchPartitionResponse>& parts, int16_t api_version);
+    static size_t encode_list_offsets_response(uint8_t* buf, size_t cap, int32_t corr_id,
+        const std::vector<ListOffsetsPartitionResponse>& parts, int16_t api_version);
     static size_t encode_metadata_response(uint8_t* buf, size_t cap, int32_t corr_id,
         int32_t broker_id, const std::string& host, uint16_t port,
         const std::vector<std::string>& topics, int32_t num_partitions);
@@ -134,16 +142,19 @@ struct MetadataInfo {
 class RequestRouter {
 public:
     using ProduceHandler = std::function<std::vector<ProducePartitionResponse>(const ProduceRequest&)>;
-    using FetchHandler = std::function<std::vector<RecordBatch>(const FetchRequest&)>;
+    using FetchHandler = std::function<std::vector<FetchPartitionResponse>(const FetchRequest&)>;
     using MetadataHandler = std::function<MetadataInfo(const std::vector<std::string>& requested_topics)>;
+    using ListOffsetsHandler = std::function<std::vector<ListOffsetsPartitionResponse>(const ListOffsetsRequest&)>;
     void set_produce_handler(ProduceHandler h) { produce_handler_ = std::move(h); }
     void set_fetch_handler(FetchHandler h) { fetch_handler_ = std::move(h); }
     void set_metadata_handler(MetadataHandler h) { metadata_handler_ = std::move(h); }
+    void set_list_offsets_handler(ListOffsetsHandler h) { list_offsets_handler_ = std::move(h); }
     size_t route_request(const uint8_t* req, uint32_t len, uint8_t* resp, size_t cap);
 private:
     ProduceHandler produce_handler_;
     FetchHandler fetch_handler_;
     MetadataHandler metadata_handler_;
+    ListOffsetsHandler list_offsets_handler_;
 };
 
 } // namespace protocol

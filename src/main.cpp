@@ -79,6 +79,54 @@ int main(int /* argc */, char* /* argv */[]) {
         return responses;
     });
 
+    router.set_list_offsets_handler([&](const blaze::ListOffsetsRequest& req) {
+        std::vector<blaze::ListOffsetsPartitionResponse> responses;
+        for (const auto& pr : req.partitions) {
+            blaze::ListOffsetsPartitionResponse resp;
+            resp.tp = pr.tp;
+            std::lock_guard<std::mutex> lock(logs_mu);
+            auto it = logs.find(pr.tp);
+            if (it == logs.end()) {
+                resp.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
+            } else {
+                auto& log = *it->second;
+                if (pr.timestamp == -2) {
+                    // Earliest
+                    resp.offset = log.start_offset();
+                } else if (pr.timestamp == -1) {
+                    // Latest
+                    resp.offset = log.next_offset();
+                } else {
+                    // Timestamp-based: return start for now
+                    resp.offset = log.start_offset();
+                }
+                resp.timestamp = -1;
+            }
+            responses.push_back(resp);
+        }
+        return responses;
+    });
+
+    router.set_fetch_handler([&](const blaze::FetchRequest& req) {
+        std::vector<blaze::FetchPartitionResponse> responses;
+        for (const auto& pf : req.partitions) {
+            blaze::FetchPartitionResponse resp;
+            resp.tp = pf.tp;
+            std::lock_guard<std::mutex> lock(logs_mu);
+            auto it = logs.find(pf.tp);
+            if (it == logs.end()) {
+                resp.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
+            } else {
+                auto result = it->second->read(pf.fetch_offset, pf.partition_max_bytes);
+                resp.high_watermark = result.high_watermark;
+                resp.record_data = result.data;
+                resp.record_data_size = result.size;
+            }
+            responses.push_back(resp);
+        }
+        return responses;
+    });
+
     router.set_metadata_handler([&](const std::vector<std::string>& requested) {
         // Auto-create requested topics (Kafka auto.create.topics.enable behavior)
         for (const auto& topic : requested) {
