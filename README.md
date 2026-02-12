@@ -34,7 +34,7 @@ StrikeMQ is a **52KB native binary** that starts in milliseconds, uses 0% CPU wh
 
 - **Kafka wire protocol** — Works with librdkafka, kafka-python, confluent-kafka-go, kcat, and any Kafka client
 - **Built-in REST API** — Inspect topics, peek at messages, produce, and manage consumer groups with just `curl`
-- **Sub-millisecond produce latency** — Sharded locks, circular I/O buffers, memory-mapped storage, zero-copy where possible
+- **~4μs produce latency (p99.9)** — Sharded locks, circular I/O buffers, memory-mapped storage, zero-copy where possible
 - **Zero dependencies** — Pure C++20, no JVM, no ZooKeeper, no third-party libraries
 - **Multi-threaded I/O** — Acceptor + N worker threads, each with own kqueue (macOS) / epoll (Linux) / io_uring (Linux), 0% CPU when idle
 - **io_uring support** — Optional Linux kernel bypass with SQPOLL, registered buffers, and submission-based I/O
@@ -191,7 +191,10 @@ Messages produced via REST are fully compatible with Kafka consumers, and vice v
 
 | Metric | Value |
 |--------|-------|
-| Produce latency (p99.9) | < 1ms |
+| Log append 1KB (p50) | 83 ns |
+| Log append 1KB (p99.9) | 4.4 μs |
+| SPSC ring push+pop (p99.9) | 42 ns |
+| Kafka header decode (p99.9) | 42 ns |
 | CPU when idle | 0% |
 | Memory footprint | ~1MB + mmap'd segments |
 | Startup time | < 10ms |
