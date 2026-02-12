@@ -560,7 +560,7 @@ void HttpServer::handle_get_broker(const HttpRequest& /*req*/, HttpResponse& res
 
     JsonWriter j;
     j.object_begin();
-    j.key("version"); j.value("0.1.4");
+    j.key("version"); j.value("0.1.5");
     j.key("broker_id"); j.value(ctx_.config.broker_id);
     j.key("uptime_seconds"); j.value(static_cast<int64_t>(uptime_s));
     j.key("port"); j.value(static_cast<int32_t>(ctx_.config.port));

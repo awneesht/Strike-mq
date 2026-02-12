@@ -32,7 +32,7 @@ int main(int /* argc */, char* /* argv */[]) {
         : config.num_io_threads;
 
     std::cout << "═══════════════════════════════════════════\n"
-              << "  StrikeMQ v0.1.4 — Sub-Millisecond Broker\n"
+              << "  StrikeMQ v0.1.5 — Sub-Millisecond Broker\n"
               << "═══════════════════════════════════════════\n"
 #ifdef STRIKE_PLATFORM_MACOS
               << "  Platform: macOS (kqueue)\n"

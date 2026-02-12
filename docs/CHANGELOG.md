@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.1.5 — io_uring Kernel Bypass & Latency Optimizations
+
+### New Features
+
+- **ShardedLogMap<64>** — 64 cache-line-aligned (`alignas(64)`) shards replace the global `logs_mu` + `unordered_map`. Each shard has its own `std::mutex` and map; shard selection via `TopicPartitionHash(tp) & 63`. Concurrent Produce/Fetch/ListOffsets to different shards never contend on the same mutex.
+
+- **FixedCircularBuffer** — Power-of-2 ring buffer (default 128KB) replaces `std::vector<uint8_t>` for connection read/write buffers. Uses monotonic head/tail counters with bitmask wrapping — all operations O(1). Page-aligned allocation for io_uring registered buffer compatibility. Eliminates `erase(begin, begin+n)` reallocation overhead after each `send()`.
+
+- **io_uring event loop** (Linux, `STRIKE_IO_URING`) — Full submission-based I/O replacing epoll `recv()`/`send()` syscalls with `io_uring_prep_recv`/`io_uring_prep_send`. Attempts SQPOLL setup first (kernel-side submission thread, 1ms idle timeout), falls back to normal mode if insufficient privileges. User-data encoding packs `UringOp` type + fd into 64-bit value for zero-lookup dispatch.
+
+- **io_uring helpers** — New `include/network/io_uring_defs.h` with `UringOp` enum and `encode_userdata`/`decode_op`/`decode_fd` helpers.
+
+- **MAP_POPULATE + pre-fault** — Linux segment mmaps use `MAP_POPULATE` to avoid TLB misses on initial writes. First 2MB of each new segment is pre-faulted with volatile reads.
+
+- **SO_BUSY_POLL** — Optional `SO_BUSY_POLL` on accepted sockets (Linux) for reduced wakeup latency from interrupt-driven ~10-50us to polling-driven.
+
+- **String hoisting in decode paths** — One `std::string` copy per topic instead of per partition in `decode_fetch`, `decode_produce`, `decode_list_offsets`, and `decode_offset_commit`.
+
+### Performance
+
+- Event loop timeout: 100ms → 1ms (kqueue `kevent`, epoll `epoll_wait`, io_uring `wait_cqe_timeout`, acceptor)
+- Connection I/O: `std::vector<uint8_t>` with erase → `FixedCircularBuffer` with O(1) advance
+- Storage lookup: global `logs_mu` → per-shard lock (1/64th contention)
+- New `BrokerConfig` fields: `busy_poll`, `io_uring_sq_entries`, `io_uring_buf_count`
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `include/core/types.h` | Added `busy_poll`, `io_uring_sq_entries`, `io_uring_buf_count` to `BrokerConfig` |
+| `include/storage/sharded_log_map.h` | **New** — `ShardedLogMap<N>` template with 64 cache-line-aligned shards |
+| `include/utils/circular_buffer.h` | **New** — `FixedCircularBuffer` ring buffer for connection I/O |
+| `include/network/io_uring_defs.h` | **New** — `UringOp` enum, userdata encoding/decoding helpers |
+| `include/network/tcp_server.h` | `Connection` uses `FixedCircularBuffer`, `WorkerThread` gains io_uring methods |
+| `include/storage/partition_log.h` | `MAP_POPULATE` + pre-fault on Linux |
+| `include/http/http_server.h` | `BrokerContext` uses `ShardedLogMap<64>&` instead of `logs` + `logs_mu` |
+| `src/network/tcp_server.cpp` | io_uring event loop, 1ms timeouts, `SO_BUSY_POLL`, string hoisting in decode paths |
+| `src/http/http_server.cpp` | Updated handlers to use `sharded_logs.find()` / `for_each()` / `erase_if()` |
+| `src/protocol/kafka_codec.cpp` | String hoisting in `decode_fetch`, `decode_produce`, `decode_list_offsets`, `decode_offset_commit` |
+| `src/main.cpp` | `ShardedLogMap<64>` replaces `unordered_map`, updated banner to v0.1.5, `BrokerContext` wiring |
+| `tests/circular_buffer_test.cpp` | **New** — Unit tests for `FixedCircularBuffer` |
+| `tests/sharded_log_map_test.cpp` | **New** — Unit tests for `ShardedLogMap` |
+| `CMakeLists.txt` | Added new test targets and source files |
+
+### Verified With
+
+- macOS build + tests (5/5 pass)
+- Smoke test with kcat (produce, consume, keyed messages)
+- HTTP API (GET /v1/broker, /v1/topics)
+
+---
+
 ## v0.1.4 — REST/HTTP Admin API
 
 ### New Features

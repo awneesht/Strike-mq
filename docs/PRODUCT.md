@@ -6,15 +6,16 @@ StrikeMQ is a lightweight Kafka-compatible message broker designed for **local d
 
 Think of it like [LocalStack](https://localstack.cloud/) for AWS or SQLite for PostgreSQL — develop locally against StrikeMQ, deploy to real Kafka in production.
 
-**Version:** 0.1.4 (Early Development)
+**Version:** 0.1.5 (Early Development)
 
 ## Key Features
 
 - **Kafka protocol compatible** — Drop-in replacement for Kafka for local development and testing
 - **Built-in REST API** — Inspect topics, peek at messages, produce, and manage consumer groups with just `curl` on port 8080
-- **Sub-millisecond latency** — Optimized for ultra-low latency with lock-free data structures and memory-mapped storage
+- **Sub-millisecond latency** — Sharded locks (64 shards), circular I/O buffers, lock-free data structures, and memory-mapped storage
 - **Zero external dependencies** — Pure C++20, no JVM, no ZooKeeper, no third-party libraries
-- **Cross-platform** — Runs on macOS (Apple Silicon + Intel) and Linux (x86-64)
+- **io_uring support** — Optional Linux kernel bypass with SQPOLL and submission-based I/O
+- **Cross-platform** — Runs on macOS (Apple Silicon + Intel) and Linux (x86-64, with optional io_uring)
 - **Lightweight** — Single 52KB binary, starts in milliseconds, 0% CPU when idle
 - **Auto-topic creation** — Topics are created automatically on first produce or metadata request
 
@@ -52,7 +53,7 @@ cmake --build .
 Output:
 ```
 ═══════════════════════════════════════════
-  StrikeMQ v0.1.4 — Sub-Millisecond Broker
+  StrikeMQ v0.1.5 — Sub-Millisecond Broker
 ═══════════════════════════════════════════
   Platform: macOS (kqueue)
   Kafka Port: 9092
@@ -238,8 +239,9 @@ Each topic-partition gets its own directory with rolling log segments. Segments 
 
 | Metric | Target | Notes |
 |--------|--------|-------|
-| Produce latency (p99.9) | < 1ms | Multi-threaded, per-partition mutex only |
-| CPU idle | 0% | Event-driven, no busy polling |
+| Produce latency (p99.9) | < 1ms | Sharded locks (1/64th contention), per-partition append mutex |
+| Produce latency (io_uring) | < 500us | Submission-based I/O, SQPOLL, no syscall per recv/send |
+| CPU idle | 0% | Event-driven, 1ms timeout |
 | Memory footprint | ~1MB + segments | Minimal base, segments are mmap'd |
 | Startup time | < 10ms | No JVM, no warmup |
 | Binary size | 52KB | Statically linked core |
@@ -249,7 +251,7 @@ Run the built-in benchmarks:
 ./build/strikemq_bench
 ```
 
-## Limitations (v0.1.4)
+## Limitations (v0.1.5)
 
 StrikeMQ is designed for local development and testing, not production. It trades durability and fault-tolerance for simplicity and speed.
 
@@ -270,9 +272,11 @@ cd build
 ctest
 
 # Run individual tests
-./strikemq_test_ring    # Lock-free ring buffer tests
-./strikemq_test_pool    # Memory pool allocation tests
-./strikemq_test_codec   # Kafka protocol codec tests
+./strikemq_test_ring              # Lock-free ring buffer tests
+./strikemq_test_pool              # Memory pool allocation tests
+./strikemq_test_codec             # Kafka protocol codec tests
+./strikemq_test_circular_buffer   # Circular I/O buffer tests
+./strikemq_test_sharded_log_map   # Sharded log map tests
 
 # Run benchmarks
 ./strikemq_bench        # Latency microbenchmarks
@@ -295,6 +299,9 @@ Configuration is currently set via the `BrokerConfig` struct defaults in `includ
 | `message_pool_block_size` | 4KB | Size of each pool block |
 | `broker_id` | `0` | Broker ID in cluster metadata |
 | `replication_factor` | `1` | Replication factor (single broker) |
+| `busy_poll` | `false` | Enable `SO_BUSY_POLL` on accepted sockets (Linux) |
+| `io_uring_sq_entries` | `256` | io_uring submission queue size (Linux) |
+| `io_uring_buf_count` | `512` | io_uring registered buffer count (Linux) |
 
 ## Stopping the Broker
 

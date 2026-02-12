@@ -2,7 +2,7 @@
 
 ## Overview
 
-StrikeMQ is a sub-millisecond, Kafka-compatible message broker written in C++20, designed for local development and testing. It implements the Kafka wire protocol so standard Kafka clients (librdkafka, kafka-python, etc.) can connect directly. A built-in REST API on port 8080 allows inspection and control with just `curl`. The broker uses a multi-threaded acceptor + N worker architecture with non-blocking event loops, targeting ultra-low latency on commodity hardware.
+StrikeMQ is a sub-millisecond, Kafka-compatible message broker written in C++20, designed for local development and testing. It implements the Kafka wire protocol so standard Kafka clients (librdkafka, kafka-python, etc.) can connect directly. A built-in REST API on port 8080 allows inspection and control with just `curl`. The broker uses a multi-threaded acceptor + N worker architecture with non-blocking event loops (kqueue/epoll/io_uring), sharded storage with 64 cache-line-aligned lock shards, and circular I/O buffers — targeting ultra-low latency on commodity hardware.
 
 ## System Architecture
 
@@ -47,6 +47,7 @@ StrikeMQ is a sub-millisecond, Kafka-compatible message broker written in C++20,
                  |
   +------------------------------------------+
   |           Shared Storage Layer            |
+  |   ShardedLogMap<64> (64 shards)           |
   |   PartitionLog per topic-partition        |
   |   (per-partition append mutex)            |
   |   ConsumerGroupManager (in-memory)        |
@@ -62,24 +63,35 @@ StrikeMQ is a sub-millisecond, Kafka-compatible message broker written in C++20,
 
 ### 1. Network Layer
 
-**Files:** `include/network/tcp_server.h`, `src/network/tcp_server.cpp`
+**Files:** `include/network/tcp_server.h`, `include/network/io_uring_defs.h`, `src/network/tcp_server.cpp`
 
 The network layer uses an **acceptor + N worker threads** architecture with two main classes:
 
 **`TcpServer` (Acceptor Thread)** — Owns the listen socket and runs an accept-only event loop:
 - Calls `accept()` on incoming connections, sets `TCP_NODELAY` and non-blocking mode
+- Optionally sets `SO_BUSY_POLL` on accepted sockets (Linux) for reduced wakeup latency
 - Round-robin distributes accepted fds to worker threads via lock-free SPSC ring buffers
 - Falls back to other workers if the target worker's ring buffer is full
 - N defaults to `std::thread::hardware_concurrency()` (configurable via `BrokerConfig::num_io_threads`)
 
 **`WorkerThread` (I/O Thread)** — Each worker runs its own event loop with independent state:
-- Own `kqueue` (macOS) or `epoll` (Linux) instance
+- Own `kqueue` (macOS), `epoll` (Linux), or `io_uring` (Linux with `STRIKE_IO_URING`) instance
 - Own `connections_` map — connection state is thread-local, no sharing between workers
+- Connection I/O uses `FixedCircularBuffer` (128KB, power-of-2 capacity, O(1) advance) instead of `std::vector<uint8_t>`
 - Pipe-based wakeup mechanism: acceptor writes a byte to the pipe after pushing an fd to the ring buffer, worker drains the pipe and registers new fds with its event loop
 - Handles all read/write/frame-extraction/routing for its assigned connections
-- Shares the `RequestRouter` (read-only after setup) and storage layer (mutex-protected) with other workers
+- Shares the `RequestRouter` (read-only after setup) and storage layer (sharded-lock-protected) with other workers
+
+**io_uring event loop** (Linux, `STRIKE_IO_URING`):
+- Attempts SQPOLL setup first (kernel-side submission thread, 1ms idle timeout), falls back to normal mode if insufficient privileges
+- Submission-based I/O: `io_uring_prep_recv` / `io_uring_prep_send` instead of `recv()`/`send()` syscalls
+- Uses `io_uring_wait_cqe_timeout` with 1ms timeout for completion harvesting
+- User-data encoding packs `UringOp` type + fd into 64-bit value for zero-lookup dispatch
+- Pipe wakeup for new-connection notification (poll_add on wakeup pipe)
 
 **Connection lifecycle:** accept (acceptor) → SPSC handoff → drain + register (worker) → read → frame → route → write → close
+
+**Event loop timeouts:** All event loops (kqueue `kevent`, epoll `epoll_wait`, io_uring `wait_cqe_timeout`, acceptor) use a **1ms timeout** for low-latency responsiveness.
 
 **Key constants:**
 | Constant | Value | Purpose |
@@ -89,6 +101,7 @@ The network layer uses an **acceptor + N worker threads** architecture with two 
 | `kMaxEvents` | 64 | Events per kqueue/epoll iteration |
 | `kListenBacklog` | 128 | TCP listen backlog |
 | SPSC capacity | 1024 | New-fd ring buffer per worker |
+| Connection buffer | 128KB | FixedCircularBuffer per read/write direction |
 
 ### 2. Protocol Layer
 
@@ -151,13 +164,22 @@ Implements the Kafka binary wire protocol with four components:
 
 ### 3. Storage Layer
 
-**Files:** `include/storage/partition_log.h`, `include/storage/consumer_group.h` (header-only implementations)
+**Files:** `include/storage/partition_log.h`, `include/storage/sharded_log_map.h`, `include/storage/consumer_group.h` (header-only implementations)
+
+**ShardedLogMap<64>** — Sharded topic-partition registry replacing the global `logs_mu` + `unordered_map`:
+- 64 cache-line-aligned (`alignas(64)`) shards, each with its own `std::mutex` and `unordered_map<TopicPartition, unique_ptr<PartitionLog>>`
+- Shard selection via `TopicPartitionHash(tp) & 63` (power-of-2 mask)
+- `find()` — O(1) lookup, locks only one shard
+- `get_or_create()` — Lazy partition creation with callback for new-topic registration
+- `for_each()` — Iterates all logs, locking each shard sequentially
+- `erase_if()` — Predicate-based removal across all shards (used by topic deletion)
+- Concurrent Produce/Fetch/ListOffsets to different shards never contend on the same mutex
 
 **LogSegment** — A single memory-mapped log file:
 - Pre-allocates segments to `max_size` (default 1GB) using `ftruncate` + `mmap`
 - Appends are sequential byte copies into the mapped region
 - Uses `std::atomic<uint64_t>` for thread-safe write offset tracking
-- Linux optimizations: `MADV_HUGEPAGE`, `POSIX_FADV_SEQUENTIAL`
+- Linux optimizations: `MAP_POPULATE` (avoids TLB misses on initial writes), `MADV_HUGEPAGE`, `POSIX_FADV_SEQUENTIAL`, and pre-faulting the first 2MB of each new segment
 - Async durability via `msync(MS_ASYNC)` in destructor, explicit `sync()` for `MS_SYNC`
 
 **OffsetIndex** — Sparse index for offset-to-position lookup:
@@ -197,7 +219,7 @@ Implements the Kafka binary wire protocol with four components:
 The REST API runs on its own thread with a single-threaded kqueue/epoll event loop (no multi-worker architecture needed for an admin API). It shares storage state with the Kafka protocol path through a `BrokerContext` struct.
 
 **BrokerContext** — Bundles references to all shared broker state:
-- `logs` + `logs_mu` — Topic-partition log registry (mutex-protected)
+- `sharded_logs` — `ShardedLogMap<64>` topic-partition registry (per-shard mutex)
 - `known_topics` + `topics_mu` — Topic name list (mutex-protected)
 - `group_mgr` — Consumer group state (internal mutex)
 - `config` — Broker configuration (read-only after startup)
@@ -222,11 +244,11 @@ The REST API runs on its own thread with a single-threaded kqueue/epoll event lo
 | Handler | Method + Path | Shared State Used |
 |---------|---------------|-------------------|
 | `handle_get_broker` | GET `/v1/broker` | `config` (read-only) |
-| `handle_get_topics` | GET `/v1/topics` | `logs` (lock `logs_mu`) |
-| `handle_get_topic` | GET `/v1/topics/{name}` | `logs` (lock `logs_mu`) |
-| `handle_delete_topic` | DELETE `/v1/topics/{name}` | `logs` + `known_topics` (lock both mutexes) |
-| `handle_get_messages` | GET `/v1/topics/{name}/messages` | `logs` (lock `logs_mu`), reads mmap'd segments |
-| `handle_post_messages` | POST `/v1/topics/{name}/messages` | `get_or_create_log` (acquires `logs_mu` internally) |
+| `handle_get_topics` | GET `/v1/topics` | `sharded_logs.for_each()` (per-shard lock) |
+| `handle_get_topic` | GET `/v1/topics/{name}` | `sharded_logs.find()` (single-shard lock) |
+| `handle_delete_topic` | DELETE `/v1/topics/{name}` | `sharded_logs.erase_if()` + `known_topics` (lock both) |
+| `handle_get_messages` | GET `/v1/topics/{name}/messages` | `sharded_logs.find()` (single-shard lock), reads mmap'd segments |
+| `handle_post_messages` | POST `/v1/topics/{name}/messages` | `get_or_create_log` (acquires shard lock internally) |
 | `handle_get_groups` | GET `/v1/groups` | `group_mgr.list_groups()` (internal mutex) |
 | `handle_get_group` | GET `/v1/groups/{id}` | `group_mgr.get_group()` (internal mutex) |
 
@@ -256,6 +278,14 @@ The REST API runs on its own thread with a single-threaded kqueue/epoll event lo
 - Cache-line aligned (64 bytes) to prevent false sharing
 - Batch pop support for drain operations (`try_pop_batch` used by workers to drain new fds)
 
+**Circular Buffer** (`include/utils/circular_buffer.h`):
+- `FixedCircularBuffer` — Fixed-capacity ring buffer replacing `std::vector<uint8_t>` for connection read/write buffers
+- Power-of-2 capacity with monotonic head/tail counters and bitmask wrapping — all operations O(1)
+- Default 128KB capacity, page-aligned allocation (4096 bytes) for io_uring registered buffer compatibility
+- `write_head()` / `read_head()` return contiguous pointer + length for direct `recv()` / `send()` targets
+- Supports external memory (no-alloc mode) for io_uring pre-registered buffer pools
+- Eliminates the `erase(begin, begin+n)` reallocation overhead of `std::vector` after each `send()`
+
 **Endian Helpers** (`include/utils/endian.h`):
 - `bswap16/32/64()` — Uses `__builtin_bswap*` when available, fallback for other compilers
 
@@ -266,17 +296,17 @@ The REST API runs on its own thread with a single-threaded kqueue/epoll event lo
 The main function wires all layers together:
 
 1. Initializes `BrokerConfig` with defaults (port 9092, HTTP port 8080, 1GB segments, `/tmp/strikemq/data`)
-2. Creates a lazy topic-partition registry (`unordered_map<TopicPartition, PartitionLog>`)
+2. Creates a `ShardedLogMap<64>` — 64-shard topic-partition registry with per-shard locking
 3. Creates a `ConsumerGroupManager` for in-memory group state
 4. Sets up `RequestRouter` handlers:
-   - **Produce handler:** Auto-creates `PartitionLog` on first write, appends record batches, returns base offsets
-   - **Fetch handler:** Looks up `PartitionLog`, calls `read()` for zero-copy segment data, returns raw mmap'd bytes
+   - **Produce handler:** Auto-creates `PartitionLog` via `sharded_logs.get_or_create()`, appends record batches, returns base offsets
+   - **Fetch handler:** Looks up via `sharded_logs.find()`, calls `read()` for zero-copy segment data, returns raw mmap'd bytes
    - **ListOffsets handler:** Resolves timestamp queries (-2=earliest, -1=latest) to actual offsets from `PartitionLog`
    - **Metadata handler:** Auto-creates requested topics (like Kafka's `auto.create.topics.enable`), returns broker info and known topics
    - **FindCoordinator handler:** Returns self (single broker is always the coordinator)
    - **JoinGroup/SyncGroup/Heartbeat/LeaveGroup handlers:** Delegate to `ConsumerGroupManager`
    - **OffsetCommit/OffsetFetch handlers:** Delegate to `ConsumerGroupManager`
-5. Creates `BrokerContext` bundling shared state, starts `HttpServer` on port 8080 (own thread)
+5. Creates `BrokerContext` bundling `sharded_logs` and other shared state, starts `HttpServer` on port 8080 (own thread)
 6. Creates `TcpServer` with the router and `num_io_threads`, binds to `0.0.0.0:9092`
 7. Runs the acceptor event loop — starts N worker threads, then blocks until SIGINT/SIGTERM
 8. On shutdown (SIGINT/SIGTERM): stops the HTTP server, then the Kafka server and workers
@@ -286,9 +316,11 @@ The main function wires all layers together:
 | Feature | macOS | Linux |
 |---------|-------|-------|
 | Event I/O | kqueue | epoll |
-| Kernel bypass | N/A | DPDK (optional) |
+| Kernel bypass | N/A | io_uring (SQPOLL, registered buffers) |
 | Huge pages | N/A | 2MB/1GB pages |
-| Async I/O | N/A | io_uring (optional) |
+| Async I/O | N/A | io_uring (submission-based recv/send) |
+| Busy poll | N/A | `SO_BUSY_POLL` (optional) |
+| Segment pre-fault | N/A | `MAP_POPULATE` + 2MB pre-fault |
 | TSC timing | `cntvct_el0` (ARM64) | `rdtsc` (x86-64) |
 | Compiler | Clang/LLVM | Clang/LLVM with LTO |
 
@@ -333,6 +365,9 @@ performance:
   message_pool_blocks: 1048576
   message_pool_block_size: 4096
   adaptive_batching: true
+  busy_poll: false              # SO_BUSY_POLL on accepted sockets (Linux)
+  io_uring_sq_entries: 256      # io_uring submission queue size
+  io_uring_buf_count: 512       # io_uring registered buffer count
 
 cluster:
   broker_id: 0
@@ -343,12 +378,12 @@ cluster:
 
 | Component | Headers | Implementation | Tests |
 |-----------|---------|----------------|-------|
-| Core types | 152 | 2 | - |
-| Protocol | 151 | 255 | 41 |
-| Storage | 190 | - (header-only) | - |
-| Network | 90 | 317 | - |
-| HTTP/REST | 160 | 1113 | - |
-| Utilities | 307 | - (header-only) | 112 |
-| Main | - | 225 | - |
-| Benchmarks | - | - | 82 |
-| **Total** | **1050** | **1912** | **235** |
+| Core types | 305 | - | - |
+| Protocol | 207 | 716 | 40 |
+| Storage | 823 | - (header-only) | 233 |
+| Network | 166 | 684 | - |
+| HTTP/REST | 158 | 1094 | - |
+| Utilities | 480 | - (header-only) | 324 |
+| Main | - | 215 | - |
+| Benchmarks | - | - | 81 |
+| **Total** | **2139** | **2709** | **678** |

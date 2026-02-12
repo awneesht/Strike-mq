@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1.4-orange" alt="Version">
+  <img src="https://img.shields.io/badge/version-0.1.5-orange" alt="Version">
   <img src="https://img.shields.io/badge/C%2B%2B-20-blue" alt="C++20">
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="Platform">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
@@ -34,9 +34,10 @@ StrikeMQ is a **52KB native binary** that starts in milliseconds, uses 0% CPU wh
 
 - **Kafka wire protocol** — Works with librdkafka, kafka-python, confluent-kafka-go, kcat, and any Kafka client
 - **Built-in REST API** — Inspect topics, peek at messages, produce, and manage consumer groups with just `curl`
-- **Sub-millisecond produce latency** — Lock-free data structures, memory-mapped storage, zero-copy where possible
+- **Sub-millisecond produce latency** — Sharded locks, circular I/O buffers, memory-mapped storage, zero-copy where possible
 - **Zero dependencies** — Pure C++20, no JVM, no ZooKeeper, no third-party libraries
-- **Multi-threaded I/O** — Acceptor + N worker threads, each with own kqueue (macOS) / epoll (Linux), 0% CPU when idle
+- **Multi-threaded I/O** — Acceptor + N worker threads, each with own kqueue (macOS) / epoll (Linux) / io_uring (Linux), 0% CPU when idle
+- **io_uring support** — Optional Linux kernel bypass with SQPOLL, registered buffers, and submission-based I/O
 - **Consumer groups** — JoinGroup, SyncGroup, Heartbeat, OffsetCommit/Fetch — full rebalance protocol
 - **Auto-topic creation** — Topics created on first produce or metadata request
 - **Cross-platform** — macOS (Apple Silicon + Intel) and Linux (x86-64)
@@ -75,7 +76,7 @@ cmake --build .
 
 ```
 ═══════════════════════════════════════════
-  StrikeMQ v0.1.4 — Sub-Millisecond Broker
+  StrikeMQ v0.1.5 — Sub-Millisecond Broker
 ═══════════════════════════════════════════
   Platform: macOS (kqueue)
   Kafka Port: 9092
@@ -152,7 +153,7 @@ StrikeMQ includes a built-in REST API on port **8080** — no Kafka tooling requ
 ```bash
 # Broker info
 curl localhost:8080/v1/broker
-# {"version":"0.1.4","broker_id":0,"uptime_seconds":42,"port":9092,"http_port":8080,...}
+# {"version":"0.1.5","broker_id":0,"uptime_seconds":42,"port":9092,"http_port":8080,...}
 
 # List topics
 curl localhost:8080/v1/topics
@@ -223,14 +224,16 @@ Run benchmarks: `./build/strikemq_bench`
 │   ├── core/types.h              # Broker config, topic types
 │   ├── http/http_server.h        # REST API server, JSON writer
 │   ├── network/tcp_server.h      # Multi-threaded TCP server (acceptor + workers)
+│   ├── network/io_uring_defs.h   # io_uring operation helpers (Linux)
 │   ├── protocol/kafka_codec.h    # Kafka encoder/decoder/router
 │   ├── storage/partition_log.h   # mmap'd log segments + index
 │   ├── storage/consumer_group.h  # Consumer group state management
-│   └── utils/                    # Ring buffers, memory pool, endian
+│   ├── storage/sharded_log_map.h # Sharded topic-partition registry (64 shards)
+│   └── utils/                    # Ring buffers, circular buffer, memory pool, endian
 ├── src/
 │   ├── main.cpp                  # Broker orchestration
 │   ├── http/http_server.cpp      # REST API handlers + HTTP parser
-│   ├── network/tcp_server.cpp    # kqueue/epoll implementation
+│   ├── network/tcp_server.cpp    # kqueue/epoll/io_uring implementation
 │   └── protocol/kafka_codec.cpp  # Wire protocol codec
 ├── tests/                        # Unit tests
 ├── benchmarks/                   # Latency microbenchmarks
@@ -246,9 +249,11 @@ cd build && ctest
 Or individually:
 
 ```bash
-./strikemq_test_ring    # Lock-free ring buffer
-./strikemq_test_pool    # Memory pool allocator
-./strikemq_test_codec   # Kafka protocol codec
+./strikemq_test_ring              # Lock-free ring buffer
+./strikemq_test_pool              # Memory pool allocator
+./strikemq_test_codec             # Kafka protocol codec
+./strikemq_test_circular_buffer   # Circular I/O buffer
+./strikemq_test_sharded_log_map   # Sharded log map
 ```
 
 ## Documentation
@@ -257,7 +262,7 @@ Or individually:
 - [Product Guide](docs/PRODUCT.md) — Full feature reference and configuration
 - [Changelog](docs/CHANGELOG.md) — Version history and bug fixes
 
-## Limitations (v0.1.0)
+## Limitations (v0.1.5)
 
 StrikeMQ is designed for local development and testing, not production. It trades durability and fault-tolerance for simplicity and speed.
 
