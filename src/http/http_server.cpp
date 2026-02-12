@@ -294,11 +294,12 @@ void HttpServer::handle_read(int fd) {
     if (it == connections_.end()) return;
     auto& conn = it->second;
 
-    uint8_t buf[8192];
     while (true) {
-        ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        auto [ptr, avail] = conn.read_buf.write_head();
+        if (avail == 0) break; // buffer full
+        ssize_t n = ::recv(fd, ptr, avail, 0);
         if (n > 0) {
-            conn.read_buf.insert(conn.read_buf.end(), buf, buf + n);
+            conn.read_buf.advance_head(static_cast<size_t>(n));
         } else if (n == 0) {
             close_connection(fd);
             return;
@@ -319,10 +320,11 @@ void HttpServer::handle_write(int fd) {
     auto& conn = it->second;
 
     while (conn.has_pending_write()) {
-        size_t remaining = conn.write_buf.size() - conn.write_offset;
-        ssize_t n = ::send(fd, conn.write_buf.data() + conn.write_offset, remaining, 0);
+        auto [ptr, avail] = conn.write_buf.read_head();
+        if (avail == 0) break;
+        ssize_t n = ::send(fd, ptr, avail, 0);
         if (n > 0) {
-            conn.write_offset += static_cast<size_t>(n);
+            conn.write_buf.advance_tail(static_cast<size_t>(n));
         } else {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             close_connection(fd);
@@ -333,8 +335,6 @@ void HttpServer::handle_write(int fd) {
     if (!conn.has_pending_write()) {
         // Connection: close — done writing, close it
         close_connection(fd);
-    } else {
-        conn.compact_write_buf();
     }
 }
 
@@ -382,8 +382,10 @@ void HttpServer::process_request(int fd) {
     if (it == connections_.end()) return;
     auto& conn = it->second;
 
-    // Look for end of headers
-    std::string data(conn.read_buf.begin(), conn.read_buf.end());
+    // Copy read buffer into a contiguous string for HTTP parsing
+    size_t buf_size = conn.read_buf.size();
+    std::string data(buf_size, '\0');
+    conn.read_buf.peek(reinterpret_cast<uint8_t*>(data.data()), buf_size);
     auto header_end = data.find("\r\n\r\n");
     if (header_end == std::string::npos) return; // incomplete headers
 
@@ -576,9 +578,7 @@ void HttpServer::handle_get_broker(const HttpRequest& /*req*/, HttpResponse& res
 }
 
 void HttpServer::handle_get_topics(const HttpRequest& /*req*/, HttpResponse& resp) {
-    std::lock_guard<std::mutex> lock(ctx_.logs_mu);
-
-    // Collect topic info
+    // Collect topic info via sharded iteration
     struct TopicInfo {
         int32_t partitions = 0;
         int64_t min_offset = 0;
@@ -586,11 +586,11 @@ void HttpServer::handle_get_topics(const HttpRequest& /*req*/, HttpResponse& res
     };
     std::unordered_map<std::string, TopicInfo, StringHash> topics;
 
-    for (const auto& [tp, log] : ctx_.logs) {
+    ctx_.sharded_logs.for_each([&](const TopicPartition& tp, storage::PartitionLog& log) {
         auto& info = topics[tp.topic];
         info.partitions++;
-        int64_t start = log->start_offset();
-        int64_t end = log->next_offset();
+        int64_t start = log.start_offset();
+        int64_t end = log.next_offset();
         if (info.partitions == 1) {
             info.min_offset = start;
             info.max_offset = end;
@@ -598,7 +598,7 @@ void HttpServer::handle_get_topics(const HttpRequest& /*req*/, HttpResponse& res
             info.min_offset = std::min(info.min_offset, start);
             info.max_offset = std::max(info.max_offset, end);
         }
-    }
+    });
 
     JsonWriter j;
     j.array_begin();
@@ -615,29 +615,23 @@ void HttpServer::handle_get_topics(const HttpRequest& /*req*/, HttpResponse& res
 }
 
 void HttpServer::handle_get_topic(const HttpRequest& /*req*/, HttpResponse& resp, const std::string& name) {
-    std::lock_guard<std::mutex> lock(ctx_.logs_mu);
-
-    // Find all partitions for this topic
+    // Find all partitions for this topic via sharded iteration
     struct PartInfo {
         int32_t partition;
         int64_t start_offset;
         int64_t end_offset;
-        size_t segment_count;
-        uint64_t segment_size;
     };
     std::vector<PartInfo> parts;
 
-    for (const auto& [tp, log] : ctx_.logs) {
+    ctx_.sharded_logs.for_each([&](const TopicPartition& tp, storage::PartitionLog& log) {
         if (tp.topic == name) {
             PartInfo p;
             p.partition = tp.partition;
-            p.start_offset = log->start_offset();
-            p.end_offset = log->next_offset();
-            p.segment_count = 0; // Not easily accessible; leave at 0
-            p.segment_size = 0;
+            p.start_offset = log.start_offset();
+            p.end_offset = log.next_offset();
             parts.push_back(p);
         }
-    }
+    });
 
     if (parts.empty()) {
         resp.status_code = 404;
@@ -670,26 +664,12 @@ void HttpServer::handle_get_topic(const HttpRequest& /*req*/, HttpResponse& resp
 }
 
 void HttpServer::handle_delete_topic(const HttpRequest& /*req*/, HttpResponse& resp, const std::string& name) {
-    // Need both locks
-    std::lock_guard<std::mutex> llock(ctx_.logs_mu);
-    std::lock_guard<std::mutex> tlock(ctx_.topics_mu);
+    // Erase matching partitions from sharded map
+    auto erased = ctx_.sharded_logs.erase_if([&](const TopicPartition& tp, storage::PartitionLog&) {
+        return tp.topic == name;
+    });
 
-    // Find and remove all partitions for this topic
-    bool found = false;
-    std::string data_dir;
-    std::vector<TopicPartition> to_remove;
-
-    for (const auto& [tp, log] : ctx_.logs) {
-        if (tp.topic == name) {
-            found = true;
-            to_remove.push_back(tp);
-            if (data_dir.empty()) {
-                data_dir = ctx_.config.log_dir + "/" + name + "-" + std::to_string(tp.partition);
-            }
-        }
-    }
-
-    if (!found) {
+    if (erased.empty()) {
         resp.status_code = 404;
         resp.status_text = "Not Found";
         JsonWriter j;
@@ -698,23 +678,25 @@ void HttpServer::handle_delete_topic(const HttpRequest& /*req*/, HttpResponse& r
         return;
     }
 
-    for (const auto& tp : to_remove) {
-        ctx_.logs.erase(tp);
-        // Delete data directory
+    // Delete data directories
+    for (const auto& tp : erased) {
         std::string dir = ctx_.config.log_dir + "/" + tp.topic + "-" + std::to_string(tp.partition);
         std::error_code ec;
         std::filesystem::remove_all(dir, ec);
     }
 
     // Remove from known_topics
-    ctx_.known_topics.erase(
-        std::remove(ctx_.known_topics.begin(), ctx_.known_topics.end(), name),
-        ctx_.known_topics.end());
+    {
+        std::lock_guard<std::mutex> tlock(ctx_.topics_mu);
+        ctx_.known_topics.erase(
+            std::remove(ctx_.known_topics.begin(), ctx_.known_topics.end(), name),
+            ctx_.known_topics.end());
+    }
 
     JsonWriter j;
     j.object_begin();
     j.key("deleted"); j.value(name);
-    j.key("partitions_removed"); j.value(static_cast<int32_t>(to_remove.size()));
+    j.key("partitions_removed"); j.value(static_cast<int32_t>(erased.size()));
     j.object_end();
     resp.body = j.str();
 }
@@ -736,9 +718,8 @@ void HttpServer::handle_get_messages(const HttpRequest& req, HttpResponse& resp,
 
     TopicPartition tp{name, partition};
 
-    std::lock_guard<std::mutex> lock(ctx_.logs_mu);
-    auto log_it = ctx_.logs.find(tp);
-    if (log_it == ctx_.logs.end()) {
+    auto* log_ptr = ctx_.sharded_logs.find(tp);
+    if (!log_ptr) {
         resp.status_code = 404;
         resp.status_text = "Not Found";
         JsonWriter j;
@@ -747,7 +728,7 @@ void HttpServer::handle_get_messages(const HttpRequest& req, HttpResponse& resp,
         return;
     }
 
-    auto& log = *log_it->second;
+    auto& log = *log_ptr;
     auto result = log.read(offset, limit * 65536); // generous max_bytes
 
     JsonWriter j;

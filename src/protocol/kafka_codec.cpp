@@ -77,11 +77,11 @@ FetchRequest KafkaDecoder::decode_fetch(BinaryReader& r, const RequestHeader& h)
     if (h.api_version >= 4) r.read_int8();
     int32_t nt = r.read_int32();
     for (int32_t t = 0; t < nt; ++t) {
-        auto topic = r.read_string();
+        std::string topic_str(r.read_string()); // hoist: one copy per topic
         int32_t np = r.read_int32();
         for (int32_t p = 0; p < np; ++p) {
             FetchRequest::PartitionFetch pf;
-            pf.tp.topic = std::string(topic);
+            pf.tp.topic = topic_str;
             pf.tp.partition = r.read_int32();
             if (h.api_version >= 9) r.read_int32();
             pf.fetch_offset = r.read_int64();
@@ -174,11 +174,11 @@ OffsetCommitRequest KafkaDecoder::decode_offset_commit(BinaryReader& r, const Re
     if (h.api_version >= 2) req.retention_time_ms = r.read_int64();
     int32_t nt = r.read_int32();
     for (int32_t t = 0; t < nt; ++t) {
-        auto topic = r.read_string();
+        std::string topic_str(r.read_string()); // hoist: one copy per topic
         int32_t np = r.read_int32();
         for (int32_t p = 0; p < np; ++p) {
             OffsetCommitPartitionRequest pr;
-            pr.tp.topic = std::string(topic);
+            pr.tp.topic = topic_str;
             pr.tp.partition = r.read_int32();
             pr.offset = r.read_int64();
             if (h.api_version == 1) pr.timestamp = r.read_int64();
@@ -196,11 +196,11 @@ OffsetFetchRequest KafkaDecoder::decode_offset_fetch(BinaryReader& r, const Requ
     req.group_id = std::string(r.read_string());
     int32_t nt = r.read_int32();
     for (int32_t t = 0; t < nt; ++t) {
-        auto topic = r.read_string();
+        std::string topic_str(r.read_string()); // hoist: one copy per topic
         int32_t np = r.read_int32();
         for (int32_t p = 0; p < np; ++p) {
             OffsetFetchPartitionRequest pr;
-            pr.tp.topic = std::string(topic);
+            pr.tp.topic = topic_str;
             pr.tp.partition = r.read_int32();
             req.partitions.push_back(std::move(pr));
         }
@@ -235,11 +235,11 @@ ListOffsetsRequest KafkaDecoder::decode_list_offsets(BinaryReader& r, const Requ
     if (h.api_version >= 2) r.read_int8(); // isolation_level
     int32_t nt = r.read_int32();
     for (int32_t t = 0; t < nt; ++t) {
-        auto topic = r.read_string();
+        std::string topic_str(r.read_string()); // hoist: one copy per topic
         int32_t np = r.read_int32();
         for (int32_t p = 0; p < np; ++p) {
             ListOffsetsRequest::PartitionRequest pr;
-            pr.tp.topic = std::string(topic);
+            pr.tp.topic = topic_str;
             pr.tp.partition = r.read_int32();
             pr.timestamp = r.read_int64();
             if (h.api_version == 0) r.read_int32(); // max_num_offsets (v0 only)

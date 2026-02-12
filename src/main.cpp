@@ -2,6 +2,7 @@
 #include "protocol/kafka_codec.h"
 #include "network/tcp_server.h"
 #include "storage/partition_log.h"
+#include "storage/sharded_log_map.h"
 #include "storage/consumer_group.h"
 #include "http/http_server.h"
 #include <algorithm>
@@ -35,6 +36,8 @@ int main(int /* argc */, char* /* argv */[]) {
               << "═══════════════════════════════════════════\n"
 #ifdef STRIKE_PLATFORM_MACOS
               << "  Platform: macOS (kqueue)\n"
+#elif defined(STRIKE_IO_URING)
+              << "  Platform: Linux (io_uring)\n"
 #else
               << "  Platform: Linux (epoll)\n"
 #endif
@@ -45,33 +48,23 @@ int main(int /* argc */, char* /* argv */[]) {
               << "═══════════════════════════════════════════\n\n"
               << std::flush;
 
-    // Storage: topic-partition -> PartitionLog (created on first produce)
-    std::mutex logs_mu;
-    std::unordered_map<strike::TopicPartition,
-                       std::unique_ptr<strike::storage::PartitionLog>,
-                       strike::TopicPartitionHash> logs;
+    // Storage: sharded topic-partition -> PartitionLog map (created on first produce)
+    strike::storage::ShardedLogMap<64> sharded_logs;
 
     std::mutex topics_mu;
     std::vector<std::string> known_topics;
 
     auto get_or_create_log = [&](const strike::TopicPartition& tp) -> strike::storage::PartitionLog& {
-        std::lock_guard<std::mutex> lock(logs_mu);
-        auto it = logs.find(tp);
-        if (it != logs.end()) return *it->second;
-        auto log = std::make_unique<strike::storage::PartitionLog>(tp, config.log_dir, config.segment_size);
-        auto& ref = *log;
-        logs.emplace(tp, std::move(log));
-        // Track topic name
-        {
-            std::lock_guard<std::mutex> tlock(topics_mu);
-            bool found = false;
-            for (const auto& t : known_topics) {
-                if (t == tp.topic) { found = true; break; }
-            }
-            if (!found) known_topics.push_back(tp.topic);
-        }
-        std::cout << "  * Created partition log: " << tp.topic << "-" << tp.partition << "\n" << std::flush;
-        return ref;
+        return sharded_logs.get_or_create(tp, config.log_dir, config.segment_size,
+            [&](const strike::TopicPartition& new_tp) {
+                std::lock_guard<std::mutex> tlock(topics_mu);
+                bool found = false;
+                for (const auto& t : known_topics) {
+                    if (t == new_tp.topic) { found = true; break; }
+                }
+                if (!found) known_topics.push_back(new_tp.topic);
+                std::cout << "  * Created partition log: " << new_tp.topic << "-" << new_tp.partition << "\n" << std::flush;
+            });
     };
 
     // Set up request router
@@ -97,21 +90,19 @@ int main(int /* argc */, char* /* argv */[]) {
         for (const auto& pr : req.partitions) {
             strike::ListOffsetsPartitionResponse resp;
             resp.tp = pr.tp;
-            std::lock_guard<std::mutex> lock(logs_mu);
-            auto it = logs.find(pr.tp);
-            if (it == logs.end()) {
+            auto* log = sharded_logs.find(pr.tp);
+            if (!log) {
                 resp.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
             } else {
-                auto& log = *it->second;
                 if (pr.timestamp == -2) {
                     // Earliest
-                    resp.offset = log.start_offset();
+                    resp.offset = log->start_offset();
                 } else if (pr.timestamp == -1) {
                     // Latest
-                    resp.offset = log.next_offset();
+                    resp.offset = log->next_offset();
                 } else {
                     // Timestamp-based: return start for now
-                    resp.offset = log.start_offset();
+                    resp.offset = log->start_offset();
                 }
                 resp.timestamp = -1;
             }
@@ -125,12 +116,11 @@ int main(int /* argc */, char* /* argv */[]) {
         for (const auto& pf : req.partitions) {
             strike::FetchPartitionResponse resp;
             resp.tp = pf.tp;
-            std::lock_guard<std::mutex> lock(logs_mu);
-            auto it = logs.find(pf.tp);
-            if (it == logs.end()) {
+            auto* log = sharded_logs.find(pf.tp);
+            if (!log) {
                 resp.error_code = 3; // UNKNOWN_TOPIC_OR_PARTITION
             } else {
-                auto result = it->second->read(pf.fetch_offset, pf.partition_max_bytes);
+                auto result = log->read(pf.fetch_offset, pf.partition_max_bytes);
                 resp.high_watermark = result.high_watermark;
                 resp.record_data = result.data;
                 resp.record_data_size = result.size;
@@ -198,7 +188,7 @@ int main(int /* argc */, char* /* argv */[]) {
 
     // Create and start HTTP admin API
     strike::http::BrokerContext http_ctx{
-        config, logs_mu, logs, topics_mu, known_topics, group_mgr, get_or_create_log
+        config, sharded_logs, topics_mu, known_topics, group_mgr, get_or_create_log
     };
     strike::http::HttpServer http_server(http_ctx);
     g_http_server = &http_server;

@@ -275,6 +275,9 @@ struct BrokerConfig {
     uint16_t http_port = 8080;
     int32_t broker_id = 0;
     int16_t replication_factor = 1;
+    bool busy_poll = false;
+    uint32_t io_uring_sq_entries = 256;
+    uint32_t io_uring_buf_count = 512;
     std::vector<std::string> bootstrap_brokers;
 };
 

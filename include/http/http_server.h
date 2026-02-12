@@ -2,6 +2,7 @@
 #include "core/types.h"
 #include "network/tcp_server.h"
 #include "storage/partition_log.h"
+#include "storage/sharded_log_map.h"
 #include "storage/consumer_group.h"
 #include <atomic>
 #include <functional>
@@ -19,9 +20,7 @@ namespace http {
 
 struct BrokerContext {
     BrokerConfig& config;
-    std::mutex& logs_mu;
-    std::unordered_map<TopicPartition, std::unique_ptr<storage::PartitionLog>,
-                       TopicPartitionHash>& logs;
+    storage::ShardedLogMap<64>& sharded_logs;
     std::mutex& topics_mu;
     std::vector<std::string>& known_topics;
     storage::ConsumerGroupManager& group_mgr;

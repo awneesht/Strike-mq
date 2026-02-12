@@ -26,14 +26,26 @@ public:
         if (::ftruncate(fd_, static_cast<off_t>(max_size)) != 0)
             throw std::runtime_error("Failed to pre-allocate segment");
 
+        int mmap_flags = MAP_SHARED;
+#ifdef STRIKE_PLATFORM_LINUX
+        mmap_flags |= MAP_POPULATE;
+#endif
         data_ = static_cast<uint8_t*>(::mmap(nullptr, max_size,
-            PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0));
+            PROT_READ | PROT_WRITE, mmap_flags, fd_, 0));
         if (data_ == MAP_FAILED) throw std::runtime_error("Failed to mmap segment");
 
 #ifdef STRIKE_PLATFORM_LINUX
         ::madvise(data_, max_size, MADV_HUGEPAGE);
         ::posix_fadvise(fd_, 0, max_size, POSIX_FADV_SEQUENTIAL);
 #endif
+        // Pre-fault first 1MB to avoid TLB misses on initial writes
+        constexpr size_t kPrefaultSize = 1048576;
+        size_t prefault = std::min(static_cast<size_t>(max_size), kPrefaultSize);
+        volatile uint8_t sink = 0;
+        for (size_t i = 0; i < prefault; i += 4096) {
+            sink = data_[i];
+        }
+        (void)sink;
     }
 
     ~LogSegment() {
