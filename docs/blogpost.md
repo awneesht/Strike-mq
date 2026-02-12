@@ -57,7 +57,7 @@ StrikeMQ has four layers, all in pure C++20 with zero third-party dependencies:
             SPSC ring buffers (lock-free)
                   |     |     |        |
           Worker 0  Worker 1  ...  Worker N-1
-          (own kqueue/epoll per thread)
+          (own kqueue/epoll/io_uring per thread)
                   |     |     |        |
               +----------------------------+
               |      Protocol Layer        |
@@ -76,9 +76,11 @@ StrikeMQ has four layers, all in pure C++20 with zero third-party dependencies:
                     |     |
               +----------------------------+
               |      Storage Layer         |
+              |  ShardedLogMap<64>         |
               |  mmap'd log segments       |
               |  sparse offset index       |
-              |  (per-partition mutex)     |
+              |  (per-shard + per-partition |
+              |   mutex)                   |
               +----------------------------+
                             |
                     /tmp/strikemq/data/
@@ -86,11 +88,13 @@ StrikeMQ has four layers, all in pure C++20 with zero third-party dependencies:
 
 ### Multi-Threaded I/O
 
-The network layer uses an **acceptor + N worker threads** architecture. The acceptor thread runs its own `kqueue` (macOS) or `epoll` (Linux) loop that does nothing but `accept()` new connections and distribute them round-robin to worker threads via lock-free SPSC ring buffers. Each worker thread runs its own event loop with its own `kqueue`/`epoll` instance, its own connection map, and a pipe-based wakeup mechanism for cross-thread notification.
+The network layer uses an **acceptor + N worker threads** architecture. The acceptor thread runs its own `kqueue` (macOS) or `epoll` (Linux) loop that does nothing but `accept()` new connections and distribute them round-robin to worker threads via lock-free SPSC ring buffers. Each worker thread runs its own event loop with its own `kqueue`/`epoll`/`io_uring` instance, its own connection map, and a pipe-based wakeup mechanism for cross-thread notification.
+
+On Linux with `STRIKE_IO_URING`, workers use **io_uring** instead of epoll — submission-based `recv`/`send` with SQPOLL for kernel-side submission. This eliminates per-I/O syscall overhead entirely.
 
 N defaults to `std::thread::hardware_concurrency()` — on a 10-core machine, that's 10 independent event loops processing requests in parallel. A slow consumer fetch on worker 3 no longer blocks a fast producer on worker 7.
 
-Every socket gets `TCP_NODELAY` for minimum latency, and each worker processes up to 64 events per iteration. Frame extraction happens inline — we read the 4-byte big-endian size prefix, accumulate bytes until a full Kafka frame arrives, then route it to the protocol layer. Connection state is thread-local to each worker, so there's no locking on the I/O hot path.
+Every socket gets `TCP_NODELAY` for minimum latency, and each worker processes up to 64 events per iteration with **1ms timeouts**. Connection I/O uses `FixedCircularBuffer` (128KB, power-of-2 ring buffer) instead of `std::vector` — O(1) advance instead of erase+realloc after every `send()`. Frame extraction happens inline — we read the 4-byte big-endian size prefix, accumulate bytes until a full Kafka frame arrives, then route it to the protocol layer. Connection state is thread-local to each worker, so there's no locking on the I/O hot path.
 
 ### Zero-Copy Storage
 
@@ -114,7 +118,7 @@ The lock-free primitives aren't theoretical — they're load-bearing infrastruct
 - **MPSC ring buffer** — Compare-and-swap loop for multi-producer safety with a committed flag per slot.
 - **Memory pool** — Pre-allocated block pool with an intrusive freelist. On Linux, it tries `MAP_HUGETLB` for 2MB pages, with automatic fallback to regular pages. The constructor touches every page to force materialization and prevent page faults on the hot path.
 
-Storage is protected with per-partition mutexes — `PartitionLog::append()` holds a lock only for its own partition, so concurrent writes to different topics never contend. The read path (`PartitionLog::read()`) is completely lock-free, using only acquire loads on atomics to see committed data.
+Storage is managed by `ShardedLogMap<64>` — 64 cache-line-aligned shards, each with its own mutex and map. A topic-partition hashes to one of 64 shards, so concurrent operations to different shards never contend. Within a shard, `PartitionLog::append()` holds a per-partition mutex, so even within the same shard, writes to different partitions are independent. The read path (`PartitionLog::read()`) is completely lock-free, using only acquire loads on atomics to see committed data.
 
 ---
 
@@ -202,17 +206,20 @@ librdkafka has a **feature gate**: it only uses Kafka v2 record batches if the b
 
 ## Performance
 
-On my M1 MacBook:
+On my M-series MacBook (measured with `strikemq_bench`, v0.1.5):
 
 | Metric | Value |
 |--------|-------|
-| Produce latency (p99.9) | < 1ms |
+| Log append 1KB (p50) | 83 ns |
+| Log append 1KB (p99.9) | 4.4 μs |
+| SPSC ring push+pop (p99.9) | 42 ns |
+| Kafka header decode (p99.9) | 42 ns |
 | CPU when idle | 0% |
 | Memory footprint | ~1MB + mmap'd segments |
 | Startup time | < 10ms |
 | Binary size | 52KB |
 
-The produce path is: recv() → parse header → decode batch → lock partition mutex → memcpy into mmap → unlock → encode response → send(). The only synchronization is a per-partition mutex, so writes to different topics are fully parallel across worker threads.
+The produce path is: recv() → parse header → decode batch → shard lookup (1/64) → lock partition mutex → memcpy into mmap → unlock → encode response → send(). Shard selection is a hash + bitmask, so writes to different topic-partitions across shards are fully parallel across worker threads with zero contention.
 
 The consume path is even simpler: recv() → parse header → binary search the offset index → return a pointer into the mmap'd segment → send(). Zero copies of the actual message data, and completely lock-free.
 
@@ -264,7 +271,7 @@ StrikeMQ is MIT licensed and runs on macOS (Apple Silicon + Intel) and Linux.
 **Docker (easiest):**
 
 ```bash
-docker run -p 9092:9092 awneesh/strikemq
+docker run -p 9092:9092 -p 8080:8080 awneesh/strikemq
 ```
 
 **Or build from source:**
